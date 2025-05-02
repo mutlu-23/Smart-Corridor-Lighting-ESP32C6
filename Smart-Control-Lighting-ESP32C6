@@ -2,10 +2,9 @@
 // Proje: Akıllı Koridor LED Aydınlatma Sistemi 
 // Hedef: ESP32-C6
 // Yazar: Mutlu PEKER 
-// Sürüm: 1.5.5 
+// Sürüm: 1.5.6 
 // =========================================================================
 
-// ==================== KÜTÜPHANELER ====================
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncTCP.h>
@@ -20,37 +19,33 @@
 #include <LittleFS.h>
 #include <Update.h>
 #include <type_traits>
-#include <cstring> // strcmp, strlen için eklendi
+#include <cstring> 
 // #include <esp_task_wdt.h> // WDT Şimdilik Devre Dışı
 
-// ==================== AYARLAR ve SABİTLER ====================
-
-// Donanım Pinleri (Sizin belirttiğiniz son çalışan değerler)
 #define PIN_LED_DATA         4
-#define PIN_RADAR_AMP        25 // Analog pin (ADC1_CH8 ESP32-C6'da yok, uygun bir GPIO seçilmeli. Varsayılan olarak 25 kullanılıyor, kontrol edin!)
+#define PIN_RADAR_AMP        25 
 #define PIN_I2C_SDA          21
 #define PIN_I2C_SCL          22
 
-// LED Ayarları
 #define LED_TYPE           SK6812
 #define COLOR_ORDER        GRB
 #define NUM_LEDS           300
 #define CORRIDOR_LENGTH_M  5.0f
 const float METERS_PER_LED = (NUM_LEDS > 0) ? (CORRIDOR_LENGTH_M / (float)NUM_LEDS) : 0.0f;
 
-// LED Efekt Türleri (v2.0.0'dan)
+
 enum EffectType : uint8_t {
   EFFECT_SIMPLE = 0, EFFECT_TRAIL, EFFECT_PULSE, EFFECT_RAINBOW, EFFECT_THEATER,
   EFFECT_COUNT
 };
 
-// Sistem Ayarları
+
 #define HOSTNAME           "koridor-led-esp32c6"
 #define CONFIG_FILE_PATH   "/config.json"
-#define LOG_BUFFER_SIZE    25 // Biraz daha artırıldı
-#define APP_VERSION        "1.5.6" // Sürüm güncellendi
+#define LOG_BUFFER_SIZE    25 
+#define APP_VERSION        "1.5.6" 
 
-// AP Modu Ayarları
+
 #define AP_SSID            "KoridorLED-Kurulum"
 #define AP_PASSWORD        "12345678"
 #define AP_IP              IPAddress(192, 168, 4, 1)
@@ -60,30 +55,30 @@ enum EffectType : uint8_t {
 // OTA Şifresi
 #define OTA_PASSWORD       "KoridorLED123!"
 
-// Zamanlama & Davranış
+
 #define SENSOR_READ_INTERVAL_MS   100
-#define LED_UPDATE_INTERVAL_MS    33    // ~30 FPS
+#define LED_UPDATE_INTERVAL_MS    33    
 #define MOTION_TIMEOUT_MS         (15 * 1000)
 #define WEBSOCKET_UPDATE_INTERVAL_MS 500
 #define WIFI_RECONNECT_INTERVAL_MS (30 * 1000)
-#define RADAR_AMP_SMOOTHING       0.6f // Daha yavaş yumuşatma (0.1 -> 0.9 arası, küçük değer daha yavaş)
-#define POSITION_SMOOTHING        0.3f // Daha hızlı pozisyon takibi (0.1 -> 0.9 arası, büyük değer daha hızlı)
+#define RADAR_AMP_SMOOTHING       0.6f 
+#define POSITION_SMOOTHING        0.3f 
 
-// ==================== VERİ YAPILARI ====================
 
-// Sistem Konfigürasyonu (v2.0.0'dan eklemelerle)
+
+
 struct SystemConfig {
   char wifi_ssid[33] = ""; char wifi_password[65] = "";
   uint16_t eveningThresholdLux = 50; uint16_t sleepThresholdLux = 5;
   uint8_t normalBrightness = 180; uint8_t nightBrightness = 30;
   uint8_t nightHue = 25; uint8_t nightSat = 230;
-  uint16_t motionThresholdAmplitude = 100; int16_t ledSegmentLength = 30; // Use int16_t for constrain compatibility if needed
+  uint16_t motionThresholdAmplitude = 100; int16_t ledSegmentLength = 30; 
   uint16_t radarAmplitudeAt1m = 500; uint16_t radarAmplitudeAt3m = 1500;
   uint16_t radarAmplitudeAt5m = 2500; uint16_t radarNoiseFloor = 50;
-  uint8_t currentEffect = EFFECT_TRAIL; uint8_t transitionSpeed = 10; // v2.0.0'dan eklendi
+  uint8_t currentEffect = EFFECT_TRAIL; uint8_t transitionSpeed = 10; 
 };
 
-// Sistem Durumu (v2.0.0'dan eklemelerle)
+
 struct SystemState {
   bool wifiConnected = false; bool apMode = false; bool tslSensorOk = true;
   bool calibrationInvalid = false; bool motionDetected = false;
@@ -96,23 +91,16 @@ struct SystemState {
   uint32_t lastReconnectAttempt = 0; String logBuffer[LOG_BUFFER_SIZE];
   uint8_t logBufferIndex = 0; uint8_t currentBrightness = 0;
   uint32_t freeHeap = 0; uint32_t uptimeSeconds = 0;
-  // v2.0.0'dan gelen ek durumlar (varsa eklenebilir, şimdilik gerek yok gibi)
-  // uint8_t currentMode = MODE_NORMAL; // Bu isEvening/isSleepTime ile yönetiliyor
+  
 };
 
-// ==================== YARDIMCI FONKSİYONLAR (Ön Tanımlar) ====================
 void addLog(String message);
 float mapFloat(float x, float in_min, float in_max, float out_min, float out_max);
 
-// Arduino max/min makroları bazen std::max/min ile çakışabilir.
-// İhtiyaç olursa diye explicit std:: kullanımı için veya kendi makromuzu tanımlamak için:
 template<typename T> T safe_max(T a, T b) { return (a > b) ? a : b; }
 template<typename T> T safe_min(T a, T b) { return (a < b) ? a : b; }
 
 
-// ==================== SINIF TANIMLARI (EKLENDİ) ====================
-
-// --- SensorManager Sınıfı ---
 class SensorManager {
 private:
   Adafruit_TSL2561_Unified tsl = Adafruit_TSL2561_Unified(TSL2561_ADDR_FLOAT, 12345);
@@ -121,7 +109,7 @@ private:
   uint16_t _rawRadarValue = 0;
   uint16_t _smoothedRadarValue = 0;
   uint32_t _lastReadTime = 0;
-  const uint16_t _radarReadSamples = 5; // Gürültü azaltmak için okunacak örnek sayısı
+  const uint16_t _radarReadSamples = 5; ısı
 
 public:
   bool begin() {
@@ -132,14 +120,13 @@ public:
     } else {
       Serial.println("TSL2561 bulundu.");
       addLog("TSL2561 bulundu.");
-      tsl.enableAutoRange(true); // Otomatik kazanç ayarı
-      tsl.setIntegrationTime(TSL2561_INTEGRATIONTIME_101MS); // Orta hız/hassasiyet
+      tsl.enableAutoRange(true);
+      tsl.setIntegrationTime(TSL2561_INTEGRATIONTIME_101MS); 
       _tslOk = true;
     }
-    // Radar pini zaten INPUT olarak ayarlandı (setupPins içinde)
-    // İlk yumuşatılmış değeri okuyalım
+    
     _smoothedRadarValue = analogRead(PIN_RADAR_AMP);
-    return _tslOk; // Veya her iki sensörün de durumuna bağlı bir değer dönebilir
+    return _tslOk; 
   }
 
   void update() {
@@ -151,33 +138,33 @@ public:
       uint32_t radarSum = 0;
       for (int i = 0; i < _radarReadSamples; i++) {
           radarSum += analogRead(PIN_RADAR_AMP);
-          delayMicroseconds(50); // ADC okumaları arasında kısa bekleme
+          delayMicroseconds(50); 
       }
       _rawRadarValue = radarSum / _radarReadSamples;
 
 
-      // Radar Yumuşatma (Exponential Moving Average)
+      
       _smoothedRadarValue = (uint16_t)((float)_rawRadarValue * RADAR_AMP_SMOOTHING + (float)_smoothedRadarValue * (1.0f - RADAR_AMP_SMOOTHING));
 
-      // TSL Okuma
+      
       if (_tslOk) {
         sensors_event_t event;
         tsl.getEvent(&event);
-        if (event.light >= 0) { // Geçerli bir değer okunduysa
+        if (event.light >= 0) { 
              _currentLux = event.light;
              // Serial.println("Lux: " + String(_currentLux)); // Debug
         } else {
              Serial.println("HATA: TSL2561 okuma hatası!");
              addLog("HATA: TSL2561 okuma hatası!");
-             _tslOk = false; // Sensör hataya geçti
-             _currentLux = 0.0f; // Hata durumunda varsayılan değer
+             _tslOk = false; 
+             _currentLux = 0.0f; 
         }
       } else {
-          // TSL çalışmıyorsa, belirli aralıklarla tekrar kontrol etmeyi deneyebiliriz
+          
           // if (now % 60000 == 0) { // Dakikada bir tekrar dene
           //   if (tsl.begin()) { _tslOk = true; /* ... */ }
           // }
-           _currentLux = 0.0f; // Sensör yoksa varsayılan
+           _currentLux = 0.0f; 
       }
     }
   }
@@ -189,78 +176,71 @@ public:
 
   // Mesafe Tahmini
   float calculateDistance(uint16_t amplitude, const SystemConfig& config) {
-    // Önce gürültü tabanının altındaki değerleri filtrele
+    
     if (amplitude <= config.radarNoiseFloor) {
-        return -1.0f; // Gürültü seviyesinde veya altında, mesafe yok
+        return -1.0f; 
     }
 
-    // Kalibrasyon noktalarını kontrol et (mantıksızsa hesaplama yapma)
-    // Mesafe arttıkça genlik artmalı!
+    
     if (!(config.radarAmplitudeAt5m >= config.radarAmplitudeAt3m &&
           config.radarAmplitudeAt3m >= config.radarAmplitudeAt1m &&
           config.radarAmplitudeAt1m > config.radarNoiseFloor) ) {
-      // Kalibrasyon noktaları mantıklı sırada değilse
+      
       static uint32_t lastCalibErrorLog = 0;
-      if (millis() - lastCalibErrorLog > 300000) { // 5 dakikada bir logla
+      if (millis() - lastCalibErrorLog > 300000) { 
           addLog("UYARI: Mesafe tahmini için radar kalibrasyonu geçersiz!");
           lastCalibErrorLog = millis();
       }
-      return -1.0f; // Geçersiz kalibrasyon
+      return -1.0f; 
     }
 
-    // Mesafe haritalama (segment bazlı mapFloat)
+    
     float distance = -1.0f;
     uint16_t noise = config.radarNoiseFloor;
     uint16_t amp1m = config.radarAmplitudeAt1m;
     uint16_t amp3m = config.radarAmplitudeAt3m;
     uint16_t amp5m = config.radarAmplitudeAt5m;
 
-    // Mesafe arttıkça genliğin ARTTIĞINI varsayıyoruz.
+    
 
-    if (amplitude <= amp1m) { // 0-1m arası (noise ile 1m arası)
+    if (amplitude <= amp1m) { 
          distance = mapFloat(amplitude, noise, amp1m, 0.0f, 1.0f);
-    } else if (amplitude <= amp3m) { // 1-3m arası
+    } else if (amplitude <= amp3m) { 
          distance = mapFloat(amplitude, amp1m, amp3m, 1.0f, 3.0f);
-    } else if (amplitude <= amp5m) { // 3-5m arası
+    } else if (amplitude <= amp5m) { 
          distance = mapFloat(amplitude, amp3m, amp5m, 3.0f, 5.0f);
-    } else { // 5m üzeri (Maksimum ölçülen genlikten büyük)
-        // Burada bir ekstrapolasyon yapılabilir veya sabit bir değer (örn. 5.0m) döndürülebilir.
-        // Şimdilik 5m olarak kabul edelim.
-        distance = 5.0f; // Veya CORRIDOR_LENGTH_M;
+    } else { 
+        
+        distance = 5.0f; 
     }
 
-    // Mesafeyi koridor uzunluğu ile sınırla
     return constrain(distance, 0.0f, CORRIDOR_LENGTH_M);
   }
 
 
-  // Kalibrasyon Fonksiyonları
+  
   uint16_t calibrateNoiseFloor() {
       const int numSamples = 50;
       uint32_t sum = 0;
       Serial.println("Gürültü tabanı ölçülüyor...");
       for (int i = 0; i < numSamples; ++i) {
           sum += analogRead(PIN_RADAR_AMP);
-          delay(10); // Örnekler arası bekleme
+          delay(10); 
       }
       uint16_t noiseFloor = sum / numSamples;
       Serial.println("Gürültü tabanı ölçüldü: " + String(noiseFloor));
-      // Yumuşatılmış değeri de güncelleyebiliriz belki? Şimdilik gerek yok.
-      // _smoothedRadarValue = noiseFloor;
+      
       return noiseFloor;
   }
 
   uint16_t captureCurrentAmplitude() {
-    // Kalibrasyon sırasında anlık, biraz daha stabilize edilmiş değeri almak iyi olabilir.
-    // update() içindeki yumuşatılmış değeri kullanalım.
-    // Veya burada da birkaç okuma yapıp ortalama alabiliriz.
-    // Şimdilik smoothed değeri dönelim.
+    
     Serial.println("Anlık yumuşatılmış genlik yakalandı: " + String(_smoothedRadarValue));
     return _smoothedRadarValue;
   }
 };
 
-// --- LedControl Sınıfı ---
+
 class LedControl {
 private:
     CRGB* _leds = nullptr;
@@ -279,37 +259,35 @@ public:
         }
     }
 
-    // Tüm LED'leri belirli bir ölçekte karartır
+    
     void fadeToBlack(uint8_t scale = 40) {
         if (!_leds) return;
         fadeToBlackBy(_leds, _numLeds, scale);
     }
 
-    //--- Efekt Fonksiyonları ---
-
-    // Basit: Belirli bir pozisyon etrafındaki segmenti yakar
+   
     void simpleEffect(float position, uint16_t segmentLength, CHSV color) {
         if (!_leds || _numLeds <= 0) return;
-        fadeToBlack(50); // Önceki izleri biraz söndür
+        fadeToBlack(50); 
         int centerLed = round(position);
-        int startLed = safe_max(0, centerLed - (int)(segmentLength / 2)); // Cast to int for safety
-        int endLed = safe_min(_numLeds - 1, centerLed + (int)(segmentLength / 2)); // Cast to int
+        int startLed = safe_max(0, centerLed - (int)(segmentLength / 2)); 
+        int endLed = safe_min(_numLeds - 1, centerLed + (int)(segmentLength / 2)); 
         for (int i = startLed; i <= endLed; ++i) {
-             // Check bounds just in case
+             
              if (i >= 0 && i < _numLeds) {
                  _leds[i] = color;
              }
         }
     }
 
-    // İz Efekti: Yanan segmentin arkasında sönük bir iz bırakır
+    
     void trailEffect(float position, uint16_t segmentLength, CHSV color) {
         if (!_leds || _numLeds <= 0) return;
-        fadeToBlack(30); // Daha yavaş söndürerek iz bırak
-        simpleEffect(position, segmentLength, color); // Ana segmenti yak
+        fadeToBlack(30); 
+        simpleEffect(position, segmentLength, color); 
     }
 
-    // Nabız Efekti: Segmentin parlaklığı artıp azalır
+    
     void pulseEffect(float position, uint16_t segmentLength, CHSV baseColor) {
         if (!_leds || _numLeds <= 0) return;
         fadeToBlack(50);
@@ -321,28 +299,28 @@ public:
         uint32_t now = millis();
         if (now - _lastEffectUpdateTime > 20) { // Nabız hızı
             _lastEffectUpdateTime = now;
-             // Basit artış/azalış
+             
             if (_pulseDirection) {
-                 _pulseBrightness = safe_min((uint8_t)250, (uint8_t)(_pulseBrightness + 5)); // Use safe_min/max
+                 _pulseBrightness = safe_min((uint8_t)250, (uint8_t)(_pulseBrightness + 5)); 
                  if (_pulseBrightness >= 250) _pulseDirection = false;
             } else {
-                 _pulseBrightness = safe_max((uint8_t)10, (uint8_t)(_pulseBrightness - 5)); // Use safe_min/max
+                 _pulseBrightness = safe_max((uint8_t)10, (uint8_t)(_pulseBrightness - 5)); 
                  if (_pulseBrightness <= 10) _pulseDirection = true;
             }
-             // _pulseBrightness = constrain(_pulseBrightness, 10, 250); // constrain is also fine
+             
         }
 
         CHSV pulseColor = baseColor;
-        pulseColor.v = _pulseBrightness; // Parlaklığı ayarla
+        pulseColor.v = _pulseBrightness; 
 
         for (int i = startLed; i <= endLed; ++i) {
-             if (i >= 0 && i < _numLeds) { // Bounds check
+             if (i >= 0 && i < _numLeds) { 
                  _leds[i] = pulseColor;
              }
         }
     }
 
-    // Gökkuşağı Segmenti: Belirtilen segmenti gökkuşağı renklerinde yakar
+    
     void rainbowEffect(float position, uint16_t segmentLength) {
         if (!_leds || _numLeds <= 0) return;
         fadeToBlack(60);
@@ -352,43 +330,41 @@ public:
         int numToFill = endLed - startLed + 1;
 
         if (numToFill > 0 && startLed < _numLeds) {
-            uint8_t initialHue = (millis() / 20) % 256; // Zamanla değişen başlangıç rengi
-            // Ensure we don't write past the end of the array
+            uint8_t initialHue = (millis() / 20) % 256; 
+            
             numToFill = safe_min(numToFill, _numLeds - startLed);
-            fill_rainbow(&(_leds[startLed]), numToFill, initialHue, 7); // 7 hue adımı
+            fill_rainbow(&(_leds[startLed]), numToFill, initialHue, 7); 
         }
     }
 
-    // Tiyatro Takibi: Segment içinde koşan ışıklar
+    
     void theaterChaseEffect(float position, uint16_t segmentLength, CHSV color) {
         if (!_leds || _numLeds <= 0) return;
-        fadeToBlack(60); // Önceki durumu temizle/söndür
+        fadeToBlack(60); 
 
         int centerLed = round(position);
         int startLed = safe_max(0, centerLed - (int)(segmentLength / 2));
         int endLed = safe_min(_numLeds - 1, centerLed + (int)(segmentLength / 2));
 
         uint32_t now = millis();
-         // Efekt hızını ayarlamak için _lastEffectUpdateTime kullanılır
-        if (now - _lastEffectUpdateTime > 100) { // Koşma hızı (ms)
-            _theaterChaseOffset = (_theaterChaseOffset + 1) % 3; // 3 adımda bir tekrar et
+         
+        if (now - _lastEffectUpdateTime > 100) { 
+            _theaterChaseOffset = (_theaterChaseOffset + 1) % 3; 
             _lastEffectUpdateTime = now;
         }
 
         for (int i = startLed; i <= endLed; i++) {
-            if (i >= 0 && i < _numLeds) { // Bounds check
+            if (i >= 0 && i < _numLeds) { 
                 if ((i % 3) == _theaterChaseOffset) {
-                    _leds[i] = color; // Her 3 LED'den birini yak
+                    _leds[i] = color; 
                 } else {
-                    _leds[i] = CRGB::Black; // Diğerlerini söndür (fadeToBlack zaten yaptı ama garanti olsun)
+                    _leds[i] = CRGB::Black; 
                 }
             }
         }
     }
 };
 
-// ==================== GÖMÜLÜ WEB VARLIKLARI (v2.0.0 Arayüzü) ====================
-// (index_html, style_css, script_js - Değişiklik yok, önceki ile aynı)
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="tr">
@@ -613,7 +589,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-// ---------- style.css (v2.0.0 Arayüzü için stiller) ----------
+// ---------- style.css ----------
 const char style_css[] PROGMEM = R"rawliteral(
 :root { --primary-color: #2196f3; --primary-dark: #0d47a1; --secondary-color: #ff9800; --text-color: #333; --background-color: #f0f2f5; --card-background: #fff; --success-color: #4caf50; --error-color: #f44336; --warning-color: #ff9800; --border-color: #dddfe2; }
 * { box-sizing: border-box; }
@@ -672,7 +648,6 @@ footer p { margin: 0.3rem 0; }
 )rawliteral";
 
 
-// ---------- script.js (v1.5.0 - Gelişmiş Arayüz Kontrolleri) ----------
 const char script_js[] PROGMEM = R"rawliteral(
 const wsUrl = `ws://${window.location.hostname}/ws`;
 let websocket;
@@ -782,12 +757,11 @@ function calibrateRadar(action) {
     .catch(e => { setStatusMessage('calibrate-status', `Kalibrasyon Hatası (${action}): ${e}`, 'error'); console.error("Radar kalibrasyon hatası:", e); });
 }
 
-// --- GÜNCELLENMİŞ uploadFirmware (v1.4.1 uyumlu) ---
+
 function uploadFirmware() {
     const fileInput = document.getElementById('firmware-file'); const uploadStatus = document.getElementById('upload-status');
     const progressBar = document.getElementById('upload-bar'); const progressPercent = document.getElementById('upload-percent');
     const progressDiv = document.getElementById('upload-progress');
-    // Button'ı form içinde daha spesifik seçelim
     const updateButton = document.querySelector('#update_firmware_form button[type="button"]');
 
 
@@ -799,11 +773,11 @@ function uploadFirmware() {
     if(updateButton) updateButton.disabled = true;
 
     const formData = new FormData();
-    // Sunucudaki ESPAsyncWebServer upload handler'ı 'update' ismini bekler
-    formData.append('update', file, file.name); // Parametre adını 'update' yap
+
+    formData.append('update', file, file.name); 
 
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/update', true); // Endpoint /update olmalı
+    xhr.open('POST', '/update', true); 
 
     xhr.upload.onprogress = function (event) { if (event.lengthComputable) { const percent = Math.round((event.loaded / event.total) * 100); progressBar.value = percent; progressPercent.textContent = `${percent}%`; } };
     xhr.onload = function () { progressDiv.style.display = 'none'; if(updateButton) updateButton.disabled = false; if (xhr.status === 200) { setStatusMessage('upload-status', 'Yazılım başarıyla yüklendi! Cihaz 5 saniye içinde yeniden başlatılıyor...', 'success', 15000); setTimeout(() => { setStatusMessage('upload-status', 'Yeniden başlatılıyor...', 'info', 0); window.location.reload(); }, 5000); } else { setStatusMessage('upload-status', `Yükleme hatası: ${xhr.responseText || xhr.statusText || xhr.status}`, 'error'); console.error('Firmware upload failed:', xhr.responseText); } };
@@ -812,7 +786,7 @@ function uploadFirmware() {
 }
 
 // --- AYAR YÖNETİMİ FONKSİYONLARI ---
-// Backup Config
+
 function backupConfig() {
     setStatusMessage('config-manage-status', 'Ayarlar indiriliyor...', 'info');
     fetch('/backup_config')
@@ -903,8 +877,6 @@ function resetConfig() {
     });
 }
 
-
-// --- ANLIK KONTROL OLAY DİNLEYİCİLERİ ---
 document.addEventListener('DOMContentLoaded', function() {
     initWebSocket(); // WebSocket'i başlat
 
@@ -946,17 +918,16 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 )rawliteral";
 
-// ==================== GLOBAL NESNELER ====================
+
 CRGB leds[NUM_LEDS];
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 SystemConfig config;
 SystemState state;
-SensorManager sensorManager; // Sensör yönetimi nesnesi (Sınıf tanımından sonra)
-LedControl ledControl;       // LED kontrol nesnesi (Sınıf tanımından sonra)
+SensorManager sensorManager; 
+LedControl ledControl;       
 
 
-// ==================== FONKSİYON PROTOTİPLERİ ====================
 void setupPins();
 bool setupWiFi();
 void setupAPMode();
@@ -968,12 +939,12 @@ void setupWebSockets();
 void setupSensors();
 void setupFastLED();
 void setupOTA();
-void addLog(String message); // Zaten yukarıda tanımlandı
+void addLog(String message); 
 String getLogsJson();
 void processRadar();
 void updateSystemState();
 void updateLeds();
-void setAllLEDs(CRGB color); // Prototip eklendi
+void setAllLEDs(CRGB color); 
 void handleSaveConfig(AsyncWebServerRequest *request, JsonVariant &json);
 void handleGetConfig(AsyncWebServerRequest *request);
 void handleGetStatus(AsyncWebServerRequest *request);
@@ -992,7 +963,7 @@ float mapFloat(float x, float in_min, float in_max, float out_min, float out_max
 void checkWifiConnection();
 
 
-// ==================== SETUP ====================
+
 void setup() {
     Serial.begin(115200);
     while (!Serial && millis() < 2000);
@@ -1013,13 +984,13 @@ void setup() {
         addLog("Ayarlar " + String(CONFIG_FILE_PATH) + " dosyasindan yuklendi.");
     }
 
-    // SensorManager.begin() çağrısı setupSensors içine taşındı
+    
     setupSensors();
 
-    // LedControl.begin() çağrısı setupFastLED içine taşındı
+    
     setupFastLED();
 
-    // setAllLEDs(CRGB::Black); // setupFastLED içinde yapıldı
+    // setAllLEDs(CRGB::Black); 
 
     if (!setupWiFi()) {
         setupAPMode();
@@ -1038,28 +1009,26 @@ void setup() {
     }
 
     addLog("Sistem kurulumu tamamlandi.");
-    state.lastMotionDetectedTime = millis() - MOTION_TIMEOUT_MS - 1000; // Başlangıçta hareket yok say
+    state.lastMotionDetectedTime = millis() - MOTION_TIMEOUT_MS - 1000; 
 }
 
-// ==================== ANA DÖNGÜ ====================
+
 void loop() {
     unsigned long currentTime = millis();
 
-    checkWifiConnection(); // WiFi bağlantısını kontrol et/yeniden bağlanmayı dene
+    checkWifiConnection(); 
     if (state.wifiConnected) {
-        ArduinoOTA.handle(); // OTA güncellemelerini dinle
+        ArduinoOTA.handle(); 
     }
 
-    ws.cleanupClients(); // WebSocket bağlantılarını temizle
+    ws.cleanupClients(); 
 
-    sensorManager.update(); // Sensörleri güncelle (içinde zaman kontrolü var)
-    processRadar();         // Radarı işle (sensör verilerini kullanır)
+    sensorManager.update(); 
+    processRadar();         
+    updateSystemState();    
+    updateLeds();          
 
-    updateSystemState();    // Genel sistem durumunu güncelle (ışık seviyesi, modlar vs.)
 
-    updateLeds();           // LED'leri güncelle (sistem durumuna ve efektlere göre, içinde zaman kontrolü var)
-
-    // Periyodik WebSocket durum güncellemesi
     if (currentTime - state.lastWsUpdateTime >= WEBSOCKET_UPDATE_INTERVAL_MS) {
         sendWsUpdate();
         state.lastWsUpdateTime = currentTime;
@@ -1068,17 +1037,12 @@ void loop() {
     // WDT beslemesi (eğer aktif edilecekse)
     // esp_task_wdt_reset();
 
-    delay(1); // Diğer görevlere zaman tanımak için küçük bir gecikme
+    delay(3); 
 }
 
-// ==================== KURULUM FONKSİYONLARI ====================
 
 void setupPins() {
     pinMode(PIN_RADAR_AMP, INPUT);
-    // ESP32-C6 için doğru ADC kanalını/pinini kullandığınızdan emin olun.
-    // `analogRead()` fonksiyonu GPIO pin numarasını alır.
-    // Gerekirse ADC yapılandırması eklenebilir (örn. `adcAttachPin()`, `analogSetAttenuation()`)
-    // Varsayılan olarak bırakılmıştır.
 
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     addLog("Pinler ayarlandı.");
@@ -1111,7 +1075,7 @@ bool setupWiFi() {
         addLog("WiFi baglandi. IP: " + ipStr);
         return true;
     } else {
-        WiFi.disconnect(false); // Bağlantıyı kes ama ayarları silme
+        WiFi.disconnect(false); 
         state.wifiConnected = false;
         Serial.println("\nWiFi Baglantisi Basarisiz!");
         addLog("HATA: WiFi baglantisi kurulamadi.");
@@ -1130,16 +1094,16 @@ void setupAPMode() {
         state.wifiConnected = false;
     } else {
         addLog("HATA: AP Modu baslatilamadi!");
-        state.apMode = false; // Başlatılamadıysa AP modunda değiliz
+        state.apMode = false; 
     }
 }
 
 void setupLittleFS() {
-    if (!LittleFS.begin(true)) { // true -> format if mount failed
+    if (!LittleFS.begin(true)) { 
         Serial.println("KRİTİK HATA: LittleFS başlatılamadı!");
         addLog("KRİTİK HATA: LittleFS başlatılamadı!");
-        // Burada belki bir LED paterni ile hata belirtilebilir
-        while(1) delay(1000); // Sonsuz döngü
+        
+        while(1) delay(1000); 
     } else {
         addLog("LittleFS başlatildi.");
         // İsteğe bağlı: Dosya sistemi içeriğini listeleme
@@ -1166,18 +1130,18 @@ bool loadConfiguration() {
         return false;
     }
 
-    DynamicJsonDocument doc(2048); // JSON kapasitesini kontrol edin
+    DynamicJsonDocument doc(2048); 
     DeserializationError error = deserializeJson(doc, configFile);
-    configFile.close(); // Dosyayı kapat
+    configFile.close();
 
     if (error) {
         addLog("HATA: Ayar dosyasi JSON olarak cozumlenemedi! Hata: " + String(error.c_str()));
-        // Hatalı dosyayı silmeyi düşünebilirsiniz
+        // Hatalı dosyayı silmeyi düşünebilirsin
         // LittleFS.remove(CONFIG_FILE_PATH);
         return false;
     }
 
-    // Değerleri SystemConfig yapısına aktar
+   
     strlcpy(config.wifi_ssid, doc["wifi_ssid"] | "", sizeof(config.wifi_ssid));
     strlcpy(config.wifi_password, doc["wifi_password"] | "", sizeof(config.wifi_password));
     config.eveningThresholdLux = doc["eveningThresholdLux"] | 50;
@@ -1195,7 +1159,7 @@ bool loadConfiguration() {
     config.currentEffect = doc["currentEffect"] | EFFECT_TRAIL;
     config.transitionSpeed = doc["transitionSpeed"] | 10;
 
-    // Yüklenen değerleri doğrula (örn. sınırlar içinde mi?)
+   
     config.normalBrightness = constrain(config.normalBrightness, 0, 255);
     config.nightBrightness = constrain(config.nightBrightness, 0, 255);
     config.nightHue = constrain(config.nightHue, 0, 255);
@@ -1216,16 +1180,16 @@ bool saveConfiguration() {
         return false;
     }
 
-    DynamicJsonDocument doc(2048); // Kapasiteyi kontrol et
+    DynamicJsonDocument doc(2048); 
 
-    // Değerleri JSON'a aktar
+    
     doc["wifi_ssid"] = config.wifi_ssid;
-    // Şifre boş değilse kaydet (güvenlik? Belki hiç kaydetmemek daha iyi?)
+    
     if (strlen(config.wifi_password) > 0) {
          doc["wifi_password"] = config.wifi_password;
-    } // Eğer şifre kısmı web arayüzünde sadece değiştirilmek istendiğinde giriliyorsa,
-      // boş şifre kaydetmemek mantıklı olabilir. Ancak config struct'ında tutuluyorsa
-      // kaydetmek gerekir. Bu haliyle struct'taki değeri kaydeder.
+    } 
+      
+      
     doc["eveningThresholdLux"] = config.eveningThresholdLux;
     doc["sleepThresholdLux"] = config.sleepThresholdLux;
     doc["normalBrightness"] = config.normalBrightness;
@@ -1254,10 +1218,10 @@ bool saveConfiguration() {
 
 void setupSensors() {
     if(!sensorManager.begin()) {
-        // Hata mesajı zaten SensorManager.begin() içinde loglanıyor
-        state.tslSensorOk = false; // Durumu güncelle
+        
+        state.tslSensorOk = false; 
     } else {
-        state.tslSensorOk = sensorManager.isLightSensorWorking(); // Başlangıç durumunu al
+        state.tslSensorOk = sensorManager.isLightSensorWorking(); 
         addLog(String("TSL2561 başlangıç durumu: ") + (state.tslSensorOk ? "OK" : "HATA"));
     }
     addLog("SensorManager başlatıldı.");
@@ -1265,14 +1229,13 @@ void setupSensors() {
 
 void setupFastLED() {
     FastLED.addLeds<LED_TYPE, PIN_LED_DATA, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
-    // Güç limitini ayarla (isteğe bağlı ama önerilir)
-    int max_mA = 18000; // Dikkat: Bu değer güç kaynağınıza ve kablolarınıza uygun olmalı!
+    int max_mA = 18000; 
     FastLED.setMaxPowerInVoltsAndMilliamps(5, max_mA);
-    FastLED.setBrightness(0); // Başlangıçta kapalı
-    ledControl.begin(leds, NUM_LEDS); // LedControl sınıfını başlat
+    FastLED.setBrightness(0); 
+    ledControl.begin(leds, NUM_LEDS); 
     addLog("FastLED/LedControl başlatildi: 5V, " + String(max_mA) + "mA limit");
-    setAllLEDs(CRGB::Black); // Tüm LED'leri başlangıçta söndür
-    FastLED.show(); // Değişikliği uygula
+    setAllLEDs(CRGB::Black); 
+    FastLED.show(); 
 }
 
 void setupOTA() {
@@ -1288,14 +1251,14 @@ void setupOTA() {
         .onStart([]() {
             String type;
             if (ArduinoOTA.getCommand() == U_FLASH) type = "sketch";
-            else type = "filesystem"; // U_SPIFFS
+            else type = "filesystem"; 
             addLog("OTA Başladı: " + type);
-            // İsteğe bağlı: LED'leri söndür veya özel bir işaret ver
-            setAllLEDs(CRGB::Blue); // Güncelleme sırasında mavi yap
+           
+            setAllLEDs(CRGB::Blue); 
         })
         .onEnd([]() {
             addLog("\nOTA Başarıyla Tamamlandı!");
-            setAllLEDs(CRGB::Green); // Başarılı olunca yeşil yap
+            setAllLEDs(CRGB::Green); 
             delay(1000);
         })
         .onProgress([](unsigned int progress, unsigned int total) {
@@ -1304,10 +1267,10 @@ void setupOTA() {
              if (percent != lastPercent) {
                 Serial.printf("OTA İlerleme: %u%%\r", percent);
                 lastPercent = percent;
-                // İsteğe bağlı: LED ile ilerleme göstergesi
+                
                  int litLeds = map(percent, 0, 100, 0, NUM_LEDS);
                  fill_solid(leds, NUM_LEDS, CRGB::Black);
-                 // Ensure litLeds is within bounds
+                 
                  litLeds = constrain(litLeds, 0, NUM_LEDS);
                  if (litLeds > 0) {
                     fill_solid(leds, litLeds, CRGB::Blue);
@@ -1324,7 +1287,7 @@ void setupOTA() {
             else if (error == OTA_RECEIVE_ERROR) errorMsg = "Alma Hatası";
             else if (error == OTA_END_ERROR) errorMsg = "Bitirme Hatası";
             addLog("OTA Hatası: " + errorMsg);
-            setAllLEDs(CRGB::Red); // Hata durumunda kırmızı yap
+            setAllLEDs(CRGB::Red); 
             delay(2000);
         });
 
@@ -1333,14 +1296,14 @@ void setupOTA() {
 }
 
 void setupWebServer() {
-    // Statik dosyalar
+    
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){ r->send_P(200, "text/html", index_html); });
     server.on("/style.css", HTTP_GET, [](AsyncWebServerRequest *r){ r->send_P(200, "text/css", style_css); });
     server.on("/script.js", HTTP_GET, [](AsyncWebServerRequest *r){ r->send_P(200, "text/javascript", script_js); });
 
-    // API Endpoints
+    
     server.on("/config", HTTP_GET, handleGetConfig);
-    // JSON config kaydetme
+    
     AsyncCallbackJsonWebHandler* configHandler = new AsyncCallbackJsonWebHandler("/config", handleSaveConfig);
     server.addHandler(configHandler);
 
@@ -1348,21 +1311,19 @@ void setupWebServer() {
     server.on("/logs", HTTP_GET, handleGetLogs);
     server.on("/calibrate", HTTP_POST, handleCalibrate);
 
-    // Firmware Güncelleme (HTTP Upload)
+    
     server.on("/update", HTTP_POST, handleHttpUpdateFinished, handleHttpUpload);
 
-    // Ayar Yönetimi
+    
     server.on("/backup_config", HTTP_GET, handleBackupConfig);
     server.on("/restore_config", HTTP_POST, [](AsyncWebServerRequest *r){
-        // Bu sadece upload bittiğinde çağrılır, asıl iş handleRestoreUpload'da yapılır
+        
         r->send(200, "text/plain", "Ayar dosyası yüklendi, işleniyor...");
-        // Geri yükleme işleminin sonucunu burada bildirmek zor,
-        // çünkü işlem handleRestoreUpload'un final kısmında tamamlanır.
-        // Belki WS üzerinden bildirim yapılabilir.
+
     }, handleRestoreUpload);
     server.on("/reset_config", HTTP_POST, handleResetConfig);
 
-    // 404 Handler
+    
     server.onNotFound(handleNotFound);
 
     addLog("Web sunucusu yolları ayarlandı.");
@@ -1370,13 +1331,11 @@ void setupWebServer() {
 
 void setupWebSockets() {
     ws.onEvent(onWsEvent);
-    server.addHandler(&ws); // WebSocket handler'ını web sunucusuna ekle
+    server.addHandler(&ws); 
     addLog("WebSocket ayarlandı.");
 }
 
-// ==================== LOGLAMA FONKSİYONLARI ====================
 
-// Yeni log mesajı ekler
 void addLog(String message) {
     // Zaman damgası ekle
     unsigned long secs = millis() / 1000;
@@ -1389,11 +1348,11 @@ void addLog(String message) {
 
     state.logBuffer[state.logBufferIndex] = logEntry;
     state.logBufferIndex = (state.logBufferIndex + 1) % LOG_BUFFER_SIZE;
-    Serial.println(logEntry); // Seriyele de yazdır
+    Serial.println(logEntry); 
 
-    // Yeni log mesajını bağlı tüm WS istemcilerine gönder
+   
     if (ws.count() > 0) {
-        DynamicJsonDocument doc(message.length() + 100); // JSON overhead için pay bırak
+        DynamicJsonDocument doc(message.length() + 100); 
         doc["type"] = "log_update";
         doc["message"] = logEntry;
         String output;
@@ -1402,17 +1361,17 @@ void addLog(String message) {
     }
 }
 
-// Tüm logları JSON formatında döndürür
+
 String getLogsJson() {
-    DynamicJsonDocument doc(LOG_BUFFER_SIZE * 150 + 100); // Buffer boyutuna göre ayarla
+    DynamicJsonDocument doc(LOG_BUFFER_SIZE * 150 + 100); 
     doc["type"] = "logs";
     JsonArray logsArray = doc.createNestedArray("logs");
 
-    // Logları doğru sırada (eskiden yeniye) ekle
-    int startIndex = state.logBufferIndex; // En son eklenenin bir sonrası (boş veya en eski)
+    
+    int startIndex = state.logBufferIndex; 
     for (int i = 0; i < LOG_BUFFER_SIZE; ++i) {
         int currentIndex = (startIndex + i) % LOG_BUFFER_SIZE;
-        if (state.logBuffer[currentIndex].length() > 0) { // Boş olmayanları ekle
+        if (state.logBuffer[currentIndex].length() > 0) { 
             logsArray.add(state.logBuffer[currentIndex]);
         }
     }
@@ -1423,106 +1382,99 @@ String getLogsJson() {
 }
 
 
-// ==================== SENSÖR OKUMA & İŞLEME ====================
-
 void processRadar() {
     state.rawRadarAmplitude = sensorManager.getRawRadarValue();
     state.smoothedRadarAmplitude = sensorManager.getSmoothedRadarValue();
     uint16_t motionThresholdValue = config.radarNoiseFloor + config.motionThresholdAmplitude;
     bool previousMotionState = state.motionDetected;
 
-    // Hareket algılama (yumuşatılmış değer ve eşik kullanılarak)
+    
     if (state.smoothedRadarAmplitude > motionThresholdValue) {
-        // Eşiğin üzerindeyse hareket var sayılır
+       
         if (!state.motionDetected) {
            // Yeni hareket algılandı
            addLog("Hareket algilandi (Amp: " + String(state.smoothedRadarAmplitude) + " > " + String(motionThresholdValue) + ")");
            state.motionDetected = true;
         }
-         state.lastMotionDetectedTime = millis(); // Hareket görüldüğü sürece zamanı güncelle
+         state.lastMotionDetectedTime = millis(); 
     } else {
-        // Eşiğin altındaysa ve belirli bir süre geçtiyse hareketi durdur
-        if (state.motionDetected && (millis() - state.lastMotionDetectedTime > 500)) { // 500ms bekleme süresi
+       
+        if (state.motionDetected && (millis() - state.lastMotionDetectedTime > 500)) { 
             addLog("Hareket durdu (Timeout)");
             state.motionDetected = false;
         }
-        // Eğer eşiğin altına yeni düştüyse, timeout süresi başlayacak
+        
     }
 
 
-    // Hareket varsa mesafe tahmini ve LED pozisyonu hesapla
-    if (state.motionDetected || (millis() - state.lastMotionDetectedTime < MOTION_TIMEOUT_MS)) { // Timeout süresince de pozisyonu tut
+    
+    if (state.motionDetected || (millis() - state.lastMotionDetectedTime < MOTION_TIMEOUT_MS)) { 
         state.estimatedDistanceMeters = sensorManager.calculateDistance(state.smoothedRadarAmplitude, config);
 
-        // Kalibrasyon geçerliliğini kontrol et (SensorManager'dan gelen bilgiye göre değil, config'e göre)
-        // Mesafe arttıkça genlik artmalı! (ESP-Radar datasheet'ine göre)
         state.calibrationInvalid = !(config.radarAmplitudeAt5m >= config.radarAmplitudeAt3m &&
                                      config.radarAmplitudeAt3m >= config.radarAmplitudeAt1m &&
-                                     config.radarAmplitudeAt1m > config.radarNoiseFloor); // Eşitlik kabul edilebilir ama > daha iyi
+                                     config.radarAmplitudeAt1m > config.radarNoiseFloor); 
 
         if (state.calibrationInvalid) {
-             // Kalibrasyon hatasını logla (çok sık olmasın)
+             
             static uint32_t lastCalibErrorLog = 0;
-            if(millis() - lastCalibErrorLog > 300000){ // 5 dakikada bir
+            if(millis() - lastCalibErrorLog > 300000){ 
                 addLog("HATA: Radar kalibrasyon değerleri geçersiz/hatalı sıralı!");
                 lastCalibErrorLog = millis();
             }
-            state.estimatedDistanceMeters = -1.0f; // Geçersiz kalibrasyonda mesafe hesaplama
-            state.targetPositionLED = -1.0f; // Hedef pozisyonu sıfırla
+            state.estimatedDistanceMeters = -1.0f;
+            state.targetPositionLED = -1.0f; 
             // state.currentPositionLED = -1.0f; // Mevcut pozisyonu da sıfırlayabiliriz veya son bilinen yerde kalabilir
         } else {
-            // Geçerli kalibrasyon ve mesafe
+            
             if (state.estimatedDistanceMeters >= 0.0f) {
-                // Mesafeyi LED pozisyonuna çevir
+               
                 state.targetPositionLED = mapFloat(state.estimatedDistanceMeters, 0.0f, CORRIDOR_LENGTH_M, 0.0f, (float)NUM_LEDS - 1.0f);
                 state.targetPositionLED = constrain(state.targetPositionLED, 0.0f, (float)NUM_LEDS - 1.0f);
 
-                // LED pozisyonunu yumuşat (hedefe doğru hareket)
                 if (state.currentPositionLED < 0.0f || !previousMotionState) {
-                    // İlk hareket algılandığında veya uzun süre sonra tekrar algılandığında direkt hedefe atla
+                    
                     state.currentPositionLED = state.targetPositionLED;
                 } else {
-                    // Yumuşak geçiş
+                    
                     state.currentPositionLED = (state.targetPositionLED * POSITION_SMOOTHING) + (state.currentPositionLED * (1.0f - POSITION_SMOOTHING));
                 }
             } else {
-                 // Mesafe hesaplanamadı (gürültü altında veya kalibrasyon dışı) ama hareket var
+                 
                  state.targetPositionLED = -1.0f;
-                 // state.currentPositionLED'i ne yapmalı? Belki son bilinen pozisyonda tutabiliriz.
+                 
             }
         }
     } else {
-        // Hareket yok (ve timeout süresi doldu)
         state.estimatedDistanceMeters = -1.0;
         state.targetPositionLED = -1.0;
-        // state.currentPositionLED = -1.0; // Hareket bitince pozisyonu sıfırla
+        
     }
 }
 
-// ==================== DURUM YÖNETİMİ ====================
 
 void updateSystemState() {
-    // Sensör durumlarını al
+    
     state.currentLux = sensorManager.getCurrentLux();
     state.tslSensorOk = sensorManager.isLightSensorWorking();
 
-    // Sistem bilgilerini güncelle
+    
     state.freeHeap = ESP.getFreeHeap();
     state.uptimeSeconds = millis() / 1000;
 
-    // Işık seviyesine göre modları belirle
+    
     if (!state.tslSensorOk) {
-        // Sensör çalışmıyorsa, her zaman akşam modunda varsayalım
+        
         state.isEvening = true;
-        state.isSleepTime = false; // Uyku modunu aktif etme
-         // Sensör hatasını logla (çok sık olmasın)
+        state.isSleepTime = false; 
+         
          static uint32_t lastTslErrorLog = 0;
-         if (millis() - lastTslErrorLog > 300000) { // 5 dakikada bir
+         if (millis() - lastTslErrorLog > 300000) { 
              addLog("UYARI: TSL2561 ışık sensörü okunamıyor, Akşam modu varsayılıyor.");
              lastTslErrorLog = millis();
          }
     } else {
-        // Sensör çalışıyor, normal kontrol
+       
         state.isEvening = (state.currentLux < config.eveningThresholdLux);
         state.isSleepTime = (state.isEvening && (state.currentLux < config.sleepThresholdLux));
     }
@@ -1538,38 +1490,32 @@ void updateSystemState() {
         String modeStr = state.isSleepTime ? "Uyku" : (state.tslSensorOk ? "Akşam" : "Akşam(Sensör Yok)");
         addLog("Isiklar AÇILIYOR. Mod: " + modeStr + " (Lux: " + String(state.currentLux, 1) + ")");
         state.lightsOn = true;
-        // Parlaklığı sıfırdan başlatıp fade-in yapacağız (updateLeds içinde)
-        // state.currentBrightness = 0; // updateLeds içinde yönetiliyor
     }
     else if (!shouldBeOn && state.lightsOn) {
         addLog("Isiklar KAPANIYOR. (Hareket Bitti veya Gündüz)");
         state.lightsOn = false;
     }
 
-    // Kalibrasyon durumunu tekrar kontrol et (processRadar içinde de ediliyor ama burada da olabilir)
      state.calibrationInvalid = !(config.radarAmplitudeAt5m >= config.radarAmplitudeAt3m &&
                                   config.radarAmplitudeAt3m >= config.radarAmplitudeAt1m &&
                                   config.radarAmplitudeAt1m > config.radarNoiseFloor);
 }
 
 
-// ==================== LED KONTROL FONKSİYONLARI ====================
-
-// LED'leri mevcut duruma göre günceller
 void updateLeds() {
     unsigned long currentMillis = millis();
-    // LED güncelleme sıklığını kontrol et (~30 FPS)
+    
     if (currentMillis - state.lastLedUpdateTime < LED_UPDATE_INTERVAL_MS) {
-        return; // Henüz güncelleme zamanı gelmedi
+        return; 
     }
     state.lastLedUpdateTime = currentMillis;
 
     if (!state.lightsOn) {
-        // Işıklar kapalıysa, yavaşça söndür
-        ledControl.fadeToBlack(40); // Karartma hızı (scale değeri)
-        // Parlaklık sıfırsa tekrar ayarlamaya gerek yok
+        
+        ledControl.fadeToBlack(40); 
+      
         if (FastLED.getBrightness() > 0) {
-            // Tamamen söndüğünden emin ol
+          
             bool allOff = true;
             for(int i=0; i<NUM_LEDS; ++i) {
                 if (leds[i]) { allOff = false; break;}
@@ -1580,13 +1526,11 @@ void updateLeds() {
             }
         }
     } else {
-        // Işıklar AÇIK
-        // Hedef parlaklığı belirle (mod'a göre)
+        
         uint8_t targetBrightness = state.isSleepTime ? config.nightBrightness : config.normalBrightness;
-        uint8_t currentLedLibBrightness = FastLED.getBrightness(); // Kütüphanenin parlaklığı
+        uint8_t currentLedLibBrightness = FastLED.getBrightness(); 
 
-        // Geçiş hızına göre parlaklığı ayarla (fade-in / fade-out)
-        uint8_t step = map(config.transitionSpeed, 1, 20, 1, 15); // Geçiş hızını map ile adıma çevir
+        uint8_t step = map(config.transitionSpeed, 1, 20, 1, 15); 
         uint8_t newBrightness = currentLedLibBrightness;
 
         if (currentLedLibBrightness < targetBrightness) {
@@ -1595,65 +1539,53 @@ void updateLeds() {
             newBrightness = safe_max(targetBrightness, (uint8_t)(currentLedLibBrightness - step));
         }
 
-        // Parlaklığı uygula (değiştiyse)
         if (newBrightness != currentLedLibBrightness) {
             FastLED.setBrightness(newBrightness);
         }
-        state.currentBrightness = newBrightness; // Sistem durumu parlaklığını güncelle
+        state.currentBrightness = newBrightness; 
 
-        // Hedef rengi belirle
+        
         CHSV color = state.isSleepTime
-                     ? CHSV(config.nightHue, config.nightSat, 255) // Gece modu rengi (parlaklık FastLED ile ayarlanıyor)
-                     : CHSV(0, 0, 255); // Normal/Akşam modu (Beyaz, parlaklık FastLED ile)
+                     ? CHSV(config.nightHue, config.nightSat, 255) 
+                     : CHSV(0, 0, 255); 
 
-        // Mevcut efekti al
+        
         EffectType effect = (EffectType)config.currentEffect;
-        float position = state.currentPositionLED; // Yumuşatılmış LED pozisyonu
+        float position = state.currentPositionLED; 
         uint16_t segment = config.ledSegmentLength;
 
-        // Efekti uygula
-        if (position >= 0.0f) { // Geçerli bir pozisyon varsa
+        if (position >= 0.0f) { 
             switch(effect) {
                 case EFFECT_SIMPLE:  ledControl.simpleEffect(position, segment, color); break;
                 case EFFECT_TRAIL:   ledControl.trailEffect(position, segment, color); break;
                 case EFFECT_PULSE:   ledControl.pulseEffect(position, segment, color); break;
-                case EFFECT_RAINBOW: ledControl.rainbowEffect(position, segment); break; // Renk parametresi yok
+                case EFFECT_RAINBOW: ledControl.rainbowEffect(position, segment); break; 
                 case EFFECT_THEATER: ledControl.theaterChaseEffect(position, segment, color); break;
-                default:             ledControl.simpleEffect(position, segment, color); break; // Bilinmeyen efekt -> Basit
+                default:             ledControl.simpleEffect(position, segment, color); break; 
             }
         } else if (state.motionDetected) {
-            // Pozisyon hesaplanamadı ama hareket var (örn. kalibrasyon hatası)
-            // Belki tüm koridoru yakabiliriz? Veya segmenti başlangıçta?
-            // Şimdilik tüm koridoru yakmayı deneyelim
              fill_solid(leds, NUM_LEDS, color);
-             // Veya sadece başlangıç segmentini yak:
-             // ledControl.simpleEffect(0.0f, segment, color);
+
         } else {
-            // Pozisyon yok ve hareket yok (bu durum updateSystemState kontrolünden sonra olmamalı ama garanti)
+            
             ledControl.fadeToBlack(30);
         }
     }
 
-    // Hesaplanan LED renklerini ve parlaklığı fiziksel şeride gönder
     FastLED.show();
 }
 
-// Tüm LED'leri belirli bir renge ayarlar (genellikle başlangıç ve özel durumlar için)
+
 void setAllLEDs(CRGB color) {
     if (!leds) return;
     fill_solid(leds, NUM_LEDS, color);
-    // FastLED.show() burada çağrılmalı mı? Genellikle evet.
     FastLED.show();
 }
 
 
-// ==================== WEB İŞLEYİCİLERİ (HANDLERS) ====================
-
-// --- Ayarları JSON olarak gönder ---
 void handleGetConfig(AsyncWebServerRequest *request) {
-    DynamicJsonDocument doc(2048); // Boyutu kontrol et
+    DynamicJsonDocument doc(2048); 
     doc["wifi_ssid"] = config.wifi_ssid;
-    // Şifreyi gönderme!
     doc["eveningThresholdLux"] = config.eveningThresholdLux;
     doc["sleepThresholdLux"] = config.sleepThresholdLux;
     doc["normalBrightness"] = config.normalBrightness;
@@ -1674,22 +1606,20 @@ void handleGetConfig(AsyncWebServerRequest *request) {
     request->send(200, "application/json", output);
 }
 
-// --- Mevcut sistem durumunu JSON olarak gönder ---
-void handleGetStatus(AsyncWebServerRequest *request) {
-    DynamicJsonDocument doc(1536); // Boyutu kontrol et
-    doc["type"] = "status_update"; // WS ile aynı formatı kullanabiliriz
 
-    // Bağlantı & Sistem
+void handleGetStatus(AsyncWebServerRequest *request) {
+    DynamicJsonDocument doc(1536); 
+    doc["type"] = "status_update"; 
+
     doc["wifiConnected"] = state.wifiConnected;
     doc["apMode"] = state.apMode;
     doc["ipAddress"] = state.apMode ? AP_IP.toString() : (state.wifiConnected ? WiFi.localIP().toString() : "N/A");
     doc["hostname"] = HOSTNAME;
     doc["version"] = APP_VERSION;
-    doc["uptimeSeconds"] = state.uptimeSeconds; // state'den al
-    doc["freeHeap"] = state.freeHeap; // state'den al
+    doc["uptimeSeconds"] = state.uptimeSeconds; 
+    doc["freeHeap"] = state.freeHeap; 
     doc["otaPasswordSet"] = (strlen(OTA_PASSWORD) > 0);
 
-    // Sensörler & Durum
     doc["tslSensorOk"] = state.tslSensorOk;
     doc["currentLux"] = state.tslSensorOk ? String(state.currentLux, 1) : "HATA";
     doc["isEvening"] = state.isEvening;
@@ -1700,15 +1630,14 @@ void handleGetStatus(AsyncWebServerRequest *request) {
     doc["estimatedDist"] = String(state.estimatedDistanceMeters, 1);
     doc["calibrationInvalid"] = state.calibrationInvalid;
 
-    // LED Durumu
     doc["lightsOn"] = state.lightsOn;
     doc["currentBrightness"] = state.currentBrightness;
     doc["currentLedPos"] = String(state.currentPositionLED, 1);
-    // Ayrı bir "leds" objesi de gönderilebilir (WS'deki gibi)
+
     JsonObject ledsObj = doc.createNestedObject("leds");
     ledsObj["on"] = state.lightsOn;
     ledsObj["brightness"] = state.currentBrightness;
-    ledsObj["effect"] = config.currentEffect; // Ayarlanan efekt
+    ledsObj["effect"] = config.currentEffect; 
     ledsObj["mode"] = state.isSleepTime ? 2 : (state.isEvening ? 1 : 0); // 0:Normal, 1:Akşam, 2:Uyku
 
     String output;
@@ -1716,14 +1645,14 @@ void handleGetStatus(AsyncWebServerRequest *request) {
     request->send(200, "application/json", output);
 }
 
-// --- Logları JSON olarak gönder ---
+
 void handleGetLogs(AsyncWebServerRequest *request) {
     request->send(200, "application/json", getLogsJson());
 }
 
-// --- Radar Kalibrasyon İşlemleri ---
+
 void handleCalibrate(AsyncWebServerRequest *request) {
-    if (!request->hasParam("action", true)) { // POST parametresi mi?
+    if (!request->hasParam("action", true)) { 
         request->send(400, "text/plain", "Eksik 'action' parametresi");
         return;
     }
@@ -1732,14 +1661,12 @@ void handleCalibrate(AsyncWebServerRequest *request) {
 
     bool calibrationChanged = false;
     String responseMsg = "";
-    uint16_t currentSmoothedAmplitude = sensorManager.getSmoothedRadarValue(); // Mevcut değeri al
+    uint16_t currentSmoothedAmplitude = sensorManager.getSmoothedRadarValue(); 
 
     if (action == "setNoiseFloor") {
-        uint16_t val = sensorManager.calibrateNoiseFloor(); // SensorManager'dan ölçümü al
+        uint16_t val = sensorManager.calibrateNoiseFloor(); 
         if (val != config.radarNoiseFloor) {
             config.radarNoiseFloor = val;
-            // Diğer noktaların gürültüden yüksek olduğundan emin ol
-            // DÜZELTME: max() fonksiyonu aynı tip argümanlar bekler. Cast yapalım.
             config.radarAmplitudeAt1m = max((uint16_t)(config.radarNoiseFloor + 1), config.radarAmplitudeAt1m);
             config.radarAmplitudeAt3m = max((uint16_t)(config.radarNoiseFloor + 1), config.radarAmplitudeAt3m);
             config.radarAmplitudeAt5m = max((uint16_t)(config.radarNoiseFloor + 1), config.radarAmplitudeAt5m);
@@ -1749,7 +1676,7 @@ void handleCalibrate(AsyncWebServerRequest *request) {
             responseMsg = "Gürültü Tabanı zaten " + String(val) + " idi.";
         }
     } else if (action == "setPoint1m") {
-        uint16_t val = sensorManager.captureCurrentAmplitude(); // Anlık (yumuşatılmış) değeri yakala
+        uint16_t val = sensorManager.captureCurrentAmplitude();
         if (val > config.radarNoiseFloor) {
             if (val != config.radarAmplitudeAt1m) {
                 config.radarAmplitudeAt1m = val;
@@ -1763,8 +1690,8 @@ void handleCalibrate(AsyncWebServerRequest *request) {
         }
     } else if (action == "setPoint3m") {
          uint16_t val = sensorManager.captureCurrentAmplitude();
-         if (val > config.radarNoiseFloor) { // Gürültüden yüksek olmalı
-             // İdealde val > config.radarAmplitudeAt1m olmalı, ama zorunlu kılmayalım
+         if (val > config.radarNoiseFloor) { 
+             
              if (val != config.radarAmplitudeAt3m) {
                  config.radarAmplitudeAt3m = val;
                  responseMsg = "3m Genlik ayarlandı: " + String(config.radarAmplitudeAt3m);
@@ -1777,8 +1704,8 @@ void handleCalibrate(AsyncWebServerRequest *request) {
          }
     } else if (action == "setPoint5m") {
          uint16_t val = sensorManager.captureCurrentAmplitude();
-          if (val > config.radarNoiseFloor) { // Gürültüden yüksek olmalı
-              // İdealde val > config.radarAmplitudeAt3m olmalı
+          if (val > config.radarNoiseFloor) { 
+              
              if (val != config.radarAmplitudeAt5m) {
                  config.radarAmplitudeAt5m = val;
                  responseMsg = "5m Genlik ayarlandı: " + String(config.radarAmplitudeAt5m);
@@ -1795,7 +1722,7 @@ void handleCalibrate(AsyncWebServerRequest *request) {
         return;
     }
 
-    // Kalibrasyon sonrası geçerliliği kontrol et
+    
     state.calibrationInvalid = !(config.radarAmplitudeAt5m >= config.radarAmplitudeAt3m &&
                                  config.radarAmplitudeAt3m >= config.radarAmplitudeAt1m &&
                                  config.radarAmplitudeAt1m > config.radarNoiseFloor);
@@ -1804,7 +1731,7 @@ void handleCalibrate(AsyncWebServerRequest *request) {
         responseMsg += " (UYARI: Noktalar hatalı sıralı!)";
     }
 
-    // Değişiklik varsa kaydet
+    
     if (calibrationChanged) {
         if (saveConfiguration()) {
             addLog("Kalibrasyon Güncellemesi: " + responseMsg);
@@ -1814,89 +1741,89 @@ void handleCalibrate(AsyncWebServerRequest *request) {
             request->send(500, "text/plain", responseMsg + " - KAYDETME BAŞARISIZ!");
         }
     } else if (responseMsg.startsWith("HATA:")) {
-        // Hata oluştu ama ayar değişmedi (örn. gürültüden düşük değer)
+       
         addLog("Kalibrasyon Hatası: " + responseMsg);
         request->send(400, "text/plain", responseMsg);
     } else {
-        // Değişiklik yok veya zaten aynı değerdi
+      
         request->send(200, "text/plain", responseMsg + " - Değişiklik yok.");
     }
 }
 
-// --- 404 Bulunamadı Handler ---
+
 void handleNotFound(AsyncWebServerRequest *request) {
     addLog("Bulunamadı (404): " + request->url());
     request->send(404, "text/plain", "404: Kaynak bulunamadi");
 }
 
-// --- HTTP Firmware Güncelleme Bitişi ---
+
 void handleHttpUpdateFinished(AsyncWebServerRequest *request) {
      if (Update.hasError()) {
-        // DÜZELTME: Update.errorString() zaten const char* döndürür, .c_str() gereksiz.
+        
         addLog("HTTP Güncelleme Hatası: " + String(Update.errorString()));
-        // Tarayıcıya daha detaylı hata gönder
+       
         AsyncResponseStream *response = request->beginResponseStream("text/plain");
-        response->printf("Update Failed Error[%u]: %s\n", Update.getError(), Update.errorString()); // .c_str() kaldırıldı
-        response->setCode(500); // Internal Server Error
+        response->printf("Update Failed Error[%u]: %s\n", Update.getError(), Update.errorString()); 
+        response->setCode(500); 
         request->send(response);
      } else {
         addLog("HTTP Güncelleme Başarılı. Boyut: " + String(Update.size()) + " bytes. Cihaz yeniden başlatılıyor.");
         request->send(200, "text/plain", "Guncelleme Basarili! Cihaz yeniden baslatiliyor...");
-        delay(200); // Yanıtın gitmesi için kısa bekleme
+        delay(200); 
         ESP.restart();
      }
 }
 
-// --- HTTP Firmware Dosyası Yükleme İşlemi ---
+
 void handleHttpUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-    if (index == 0) { // Yükleme başlangıcı
+    if (index == 0) { 
         if (!filename.endsWith(".bin")) {
             addLog("HATA: Yüklenen dosya .bin değil: " + filename);
             return request->send(400, "text/plain", "Sadece .bin dosyaları kabul edilir.");
         }
         addLog("HTTP Güncelleme Başladı: " + filename);
-        // Gerekli boyut kontrolü (ESP32-C6'nın flash boyutuna göre)
+        
         uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
-         if (!Update.begin(maxSketchSpace)) { // U_FLASH varsayılan
-             // DÜZELTME: String() ile çevirerek birleştirme
+         if (!Update.begin(maxSketchSpace)) { 
+             
             addLog("Update.begin HATA: " + String(Update.errorString()));
             Update.printError(Serial);
              return request->send(500, "text/plain", String("Yazılım güncelleme başlatılamadı: ") + Update.errorString());
         }
-        // İsteğe bağlı: Güncelleme sırasında LED göstergesi
+        
          setAllLEDs(CRGB::Orange);
     }
 
-    // Veriyi flash'a yaz
+    
     if (len > 0) {
         if (Update.write(data, len) != len) {
-            // DÜZELTME: String() ile çevirerek birleştirme
+            
             addLog("Update.write HATA: " + String(Update.errorString()));
             Update.printError(Serial);
              return request->send(500, "text/plain", String("Yazılım yazma hatası: ") + Update.errorString());
         }
     }
 
-    // İlerleme logu (çok sık olmasın)
+    
     static uint32_t lastProgressLog = 0;
     if (millis() - lastProgressLog > 1000) {
         Serial.printf("HTTP Güncelleme İlerleme: %u / %u bytes\n", index + len, request->contentLength());
         lastProgressLog = millis();
     }
 
-    if (final) { // Yükleme tamamlandı
-        if (!Update.end(true)) { // true: başarıyla tamamla
-            // DÜZELTME: String() ile çevirerek birleştirme
+    if (final) { 
+        if (!Update.end(true)) { 
+            
             addLog("Update.end HATA: " + String(Update.errorString()));
             Update.printError(Serial);
             return request->send(500, "text/plain", String("Yazılım sonlandırma hatası: ") + Update.errorString());
         }
         addLog("HTTP Güncelleme Tamamlandı (Yazma bitti).");
-        // handleHttpUpdateFinished çağrılacak ve cihazı yeniden başlatacak.
+        
     }
 }
 
-// --- Ayarları Yedekle (İndirme) ---
+
 void handleBackupConfig(AsyncWebServerRequest *request) {
     if (!LittleFS.exists(CONFIG_FILE_PATH)) {
         addLog("Yedekleme Hatası: Ayar dosyası bulunamadı.");
@@ -1909,74 +1836,68 @@ void handleBackupConfig(AsyncWebServerRequest *request) {
          return request->send(500, "text/plain", "Ayar dosyası açılamadı.");
     }
 
-    // Dosya adını oluştur (örn: koridor-led-config-YYYYMMDD.json)
-    // Zaman almak için NTP veya RTC gerekebilir, şimdilik sabit isim kullanalım
     String filename = String(HOSTNAME) + "-config_backup.json";
 
-    // Tarayıcıya indirme olarak gönder
     AsyncWebServerResponse *response = request->beginResponse(
-        LittleFS, CONFIG_FILE_PATH, "application/json", true // true: download
+        LittleFS, CONFIG_FILE_PATH, "application/json", true 
     );
-    // response->addHeader("Content-Disposition", "attachment; filename=\"" + filename + "\""); // Gerekirse dosya adını ayarla
+    // response->addHeader("Content-Disposition", "attachment; filename=\"" + filename + "\""); 
     request->send(response);
     addLog("Ayar dosyası yedeklemesi gönderildi.");
     // file.close(); // beginResponse dosyayı kendi kapatır
 }
 
-// --- Ayarları Geri Yükle (Yükleme) ---
-void handleRestoreUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-     String tempFilePath = "/restore_temp.json"; // Geçici dosya adı
 
-     if (index == 0) { // Yükleme başlangıcı
+void handleRestoreUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+     String tempFilePath = "/restore_temp.json"; 
+
+     if (index == 0) { 
         addLog("Ayar geri yükleme başladı: " + filename);
         if (!filename.endsWith(".json")) {
             addLog("HATA: Geri yükleme için sadece .json dosyaları kabul edilir.");
-            // İsteği burada kesmek gerekebilir ama AsyncWebServer bunu doğrudan desteklemiyor olabilir.
-            // final kısmında kontrol edip sileriz.
-            return; // Hata mesajı gönderemiyoruz, final'de hallet
+
+            return; 
         }
 
-        // Eski geçici dosyayı sil (varsa)
         if(LittleFS.exists(tempFilePath)) {
             LittleFS.remove(tempFilePath);
         }
-        // Yeni geçici dosyayı aç
+
         restoreFile = LittleFS.open(tempFilePath, "w");
         if (!restoreFile) {
              addLog("HATA: Geri yükleme için geçici dosya oluşturulamadı!");
-             // Hata yönetimi?
+             
              return;
         }
      }
 
-     // Veriyi geçici dosyaya yaz
+     
      if (len > 0 && restoreFile) {
         if (restoreFile.write(data, len) != len) {
              addLog("HATA: Geçici ayar dosyasına yazma hatası!");
              restoreFile.close();
-             LittleFS.remove(tempFilePath); // Hatalı dosyayı sil
-             // Hata yönetimi?
+             LittleFS.remove(tempFilePath); 
+             
              return;
         }
      }
 
-     if (final) { // Yükleme bitti
+     if (final) { 
         addLog("Ayar dosyası yüklemesi tamamlandı: " + filename);
         if (restoreFile) {
-            restoreFile.close(); // Dosyayı kapat
+            restoreFile.close(); 
         }
 
-        // Dosya adını tekrar kontrol et (ilk index'te hata olsa bile buraya gelebilir)
+        
         if (!filename.endsWith(".json")) {
             addLog("HATA: Yüklenen dosya .json değil, geri yükleme iptal edildi.");
              LittleFS.remove(tempFilePath); // Geçici dosyayı sil
-             // İstemciye hata gönderme şansı yok, log yeterli.
-             // request->send(400, "text/plain", "Sadece .json kabul edilir"); // Burası çalışmaz
+
             return;
         }
 
 
-        // Geçici dosyayı oku ve doğrula (JSON mu?)
+        
         restoreFile = LittleFS.open(tempFilePath, "r");
         if (!restoreFile) {
             addLog("HATA: Geçici ayar dosyası okunamadı!");
@@ -1984,18 +1905,17 @@ void handleRestoreUpload(AsyncWebServerRequest *request, String filename, size_t
             return;
         }
 
-        DynamicJsonDocument doc(2048); // Boyut?
+        DynamicJsonDocument doc(2048); 
         DeserializationError error = deserializeJson(doc, restoreFile);
         restoreFile.close();
 
         if (error) {
              addLog("HATA: Yüklenen ayar dosyası geçersiz JSON formatında! Hata: " + String(error.c_str()));
-             LittleFS.remove(tempFilePath); // Geçersiz dosyayı sil
-             // İstemciye hata?
+             LittleFS.remove(tempFilePath); 
+             
              return;
         }
 
-        // Geçerli JSON ise, eski config dosyasını silip yenisini kopyala
         if (LittleFS.remove(CONFIG_FILE_PATH)) {
             addLog("Eski ayar dosyası silindi.");
         } else {
@@ -2004,13 +1924,12 @@ void handleRestoreUpload(AsyncWebServerRequest *request, String filename, size_t
 
         if (LittleFS.rename(tempFilePath, CONFIG_FILE_PATH)) {
             addLog("Ayarlar başarıyla geri yüklendi! Değişiklikler için yeniden başlatın.");
-            // Başarı mesajı? Belki WS ile.
-            // Ayarları hemen yükle?
+
             loadConfiguration();
         } else {
              addLog("HATA: Geçici ayar dosyası asıl yerine taşınamadı!");
-             LittleFS.remove(tempFilePath); // Kalan geçiciyi sil
-             // Hata mesajı?
+             LittleFS.remove(tempFilePath); 
+             
         }
      }
 }
@@ -2019,21 +1938,19 @@ void handleRestoreUpload(AsyncWebServerRequest *request, String filename, size_t
 void handleResetConfig(AsyncWebServerRequest *request) {
     addLog("Fabrika ayarlarına sıfırlama isteği alındı...");
 
-    // Ayar dosyasını sil
+    
     if (LittleFS.remove(CONFIG_FILE_PATH)) {
         addLog("Ayar dosyası (" + String(CONFIG_FILE_PATH) + ") silindi.");
         request->send(200, "text/plain", "Ayarlar sıfırlandı. Cihaz yeniden başlatılıyor...");
-        delay(500); // Yanıtın gitmesi için bekle
+        delay(500); 
         ESP.restart();
     } else {
         addLog("HATA: Ayar dosyası silinemedi (belki zaten yoktu).");
          request->send(500, "text/plain", "Ayar dosyası silinemedi.");
     }
-    // Not: Varsayılan ayarlar bir sonraki açılışta loadConfiguration başarısız olunca
-    // otomatik olarak saveConfiguration ile tekrar oluşturulacak.
+
 }
 
-// --- Yeni Gelen Ayarları İşle ve Kaydet ---
 void handleSaveConfig(AsyncWebServerRequest *request, JsonVariant &json) {
     addLog("POST /config istegi alindi.");
     JsonObject jsonObj = json.as<JsonObject>();
@@ -2044,12 +1961,9 @@ void handleSaveConfig(AsyncWebServerRequest *request, JsonVariant &json) {
     }
 
     bool configChanged = false;
-    bool wifiChanged = false; // WiFi ayarları değişirse yeniden başlatma gerekebilir
+    bool wifiChanged = false; 
 
-    // DÜZELTME: Daha basit ve hataya daha az açık bir güncelleme yöntemi kullanalım.
-    // Lambda yerine doğrudan her alanı kontrol edelim.
 
-    // --- String Alanlar ---
     if (jsonObj.containsKey("wifi_ssid")) {
         JsonVariantConst val = jsonObj["wifi_ssid"];
         if(val.is<const char*>()) {
@@ -2078,12 +1992,11 @@ void handleSaveConfig(AsyncWebServerRequest *request, JsonVariant &json) {
             } else if (strlen(newPass) >= sizeof(config.wifi_password)) {
                  addLog("UYARI: Girilen WiFi şifresi çok uzun!");
             }
-            // Boş şifre gelirse bir şey yapma (mevcutu koru)
+            
         }
     }
 
-    // --- Sayısal Alanlar ---
-    // Helper macro for numeric updates
+
     #define UPDATE_NUMERIC_CONFIG(VAR, KEY, TYPE, DEFAULT, MIN_VAL, MAX_VAL) \
         if (jsonObj.containsKey(KEY)) { \
             JsonVariantConst val = jsonObj[KEY]; \
@@ -2110,7 +2023,7 @@ void handleSaveConfig(AsyncWebServerRequest *request, JsonVariant &json) {
     UPDATE_NUMERIC_CONFIG(config.nightBrightness, "nightBrightness", uint8_t, 30, 0, 255);
     UPDATE_NUMERIC_CONFIG(config.nightHue, "nightHue", uint8_t, 25, 0, 255);
     UPDATE_NUMERIC_CONFIG(config.nightSat, "nightSat", uint8_t, 230, 0, 255);
-    UPDATE_NUMERIC_CONFIG(config.motionThresholdAmplitude, "motionThresholdAmplitude", uint16_t, 100, 1, 4095); // ADC range?
+    UPDATE_NUMERIC_CONFIG(config.motionThresholdAmplitude, "motionThresholdAmplitude", uint16_t, 100, 1, 4095); 
     UPDATE_NUMERIC_CONFIG(config.ledSegmentLength, "ledSegmentLength", int16_t, 30, 1, NUM_LEDS);
     UPDATE_NUMERIC_CONFIG(config.radarAmplitudeAt1m, "radarAmplitudeAt1m", uint16_t, 500, 0, 4095);
     UPDATE_NUMERIC_CONFIG(config.radarAmplitudeAt3m, "radarAmplitudeAt3m", uint16_t, 1500, 0, 4095);
@@ -2119,10 +2032,9 @@ void handleSaveConfig(AsyncWebServerRequest *request, JsonVariant &json) {
     UPDATE_NUMERIC_CONFIG(config.currentEffect, "currentEffect", uint8_t, EFFECT_TRAIL, 0, EFFECT_COUNT - 1);
     UPDATE_NUMERIC_CONFIG(config.transitionSpeed, "transitionSpeed", uint8_t, 10, 1, 20);
 
-    #undef UPDATE_NUMERIC_CONFIG // Makroyu temizle
+    #undef UPDATE_NUMERIC_CONFIG 
 
 
-    // --- Kaydetme ve Yanıt ---
     if (configChanged) {
         addLog("Ayarlar değiştirildi, kaydediliyor...");
         if (saveConfiguration()) {
@@ -2131,7 +2043,7 @@ void handleSaveConfig(AsyncWebServerRequest *request, JsonVariant &json) {
                  responseMsg += " WiFi ayarları değişti, cihaz yeniden başlatılacak.";
                  request->send(200, "text/plain", responseMsg);
                  addLog(responseMsg);
-                 delay(1000); // Yanıtın gitmesi için bekle
+                 delay(1000); 
                  ESP.restart();
             } else {
                  request->send(200, "text/plain", responseMsg);
@@ -2145,7 +2057,7 @@ void handleSaveConfig(AsyncWebServerRequest *request, JsonVariant &json) {
         addLog("Ayarlarda değişiklik yapılmadı.");
         request->send(200, "text/plain", "Ayarlarda değişiklik yapılmadı.");
     }
-} // handleSaveConfig sonu
+} 
 
 
 // ==================== WEBSOCKET OLAYLARI ====================
@@ -2154,21 +2066,21 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
         case WS_EVT_CONNECT:
             Serial.printf("WS Client #%u baglandi: %s\n", client->id(), client->remoteIP().toString().c_str());
             addLog("WS Client #" + String(client->id()) + " baglandi.");
-            // Bağlanan istemciye hemen mevcut durumu ve logları gönder
-            sendWsUpdate(); // Tek istemciye gönderme fonksiyonu olsaydı daha iyi olurdu, şimdilik herkese gönderelim
-            client->text(getLogsJson()); // Logları sadece bu istemciye gönder
+            
+            sendWsUpdate(); 
+            client->text(getLogsJson()); 
             break;
         case WS_EVT_DISCONNECT:
             Serial.printf("WS Client #%u koptu\n", client->id());
             addLog("WS Client #" + String(client->id()) + " koptu.");
             break;
         case WS_EVT_DATA:
-            { // Scope for AwsFrameInfo
+            { 
                 AwsFrameInfo *info = (AwsFrameInfo*)arg;
                 if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
-                    data[len] = 0; // Null-terminate
+                    data[len] = 0; 
                     String message = (char*)data;
-                    DynamicJsonDocument doc(512); // Gelen komutlar için JSON
+                    DynamicJsonDocument doc(512); 
                     DeserializationError error = deserializeJson(doc, message);
 
                     if (!error && doc.containsKey("command")) {
@@ -2176,12 +2088,10 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
                         addLog("WS Komut #" + String(client->id()) + ": " + command);
 
                         if (command == "getStatus") {
-                            // Anlık durum zaten periyodik gönderiliyor, belki tek istemciye tekrar gönderilebilir
-                             sendWsUpdate(); // Şimdilik herkese
+                             sendWsUpdate(); 
                         } else if (command == "getLogs") {
-                            client->text(getLogsJson()); // Sadece isteyen istemciye
+                            client->text(getLogsJson()); 
                         } else if (command == "getConfig") {
-                            // Ayarları JSON olarak hazırla (şifre hariç)
                             DynamicJsonDocument cfgDoc(2048);
                             cfgDoc["type"] = "config_data";
                             JsonObject dataObj = cfgDoc.createNestedObject("data");
@@ -2202,24 +2112,21 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
                             dataObj["transitionSpeed"]=config.transitionSpeed;
                             String output;
                             serializeJson(cfgDoc, output);
-                            client->text(output); // Sadece isteyen istemciye
+                            client->text(output); 
                         } else if (command == "setEffect") {
                             if(doc.containsKey("value")) {
                                 uint8_t newEffect = constrain(doc["value"].as<uint8_t>(), 0, EFFECT_COUNT - 1);
                                 if (config.currentEffect != newEffect) {
                                     config.currentEffect = newEffect;
                                     addLog("Efekt degistirildi (WS): " + String(config.currentEffect));
-                                    saveConfiguration(); // Efekt değişikliğini kaydet
+                                    saveConfiguration(); 
                                 }
                             }
                         } else if (command == "setBrightness") {
                              if(doc.containsKey("value")) {
                                 uint8_t br = constrain(doc["value"].as<uint8_t>(), 0, 255);
                                 bool changed = false;
-                                // Hangi parlaklığı güncelleyeceğimizi belirle (mevcut moda göre)
-                                // Bu anlık kontrol olduğu için, belki de config'i değil,
-                                // sadece state.currentBrightness'ı etkilemeli?
-                                // Ama kullanıcı bunu kalıcı yapmak isteyebilir. Config'i güncelleyelim.
+
                                 if(state.isSleepTime) {
                                     if (config.nightBrightness != br) {
                                         config.nightBrightness = br;
@@ -2233,28 +2140,20 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
                                 }
                                 if (changed) {
                                      addLog("Parlaklik ayarlandi (WS): " + String(br) + " (Mod: " + (state.isSleepTime?"Gece":"Normal/Akşam") + ")");
-                                     saveConfiguration(); // Parlaklığı kaydet
+                                     saveConfiguration(); 
                                 }
-                                // Anlık parlaklığı da hemen ayarlayalım (fade efekti yerine)
-                                // FastLED.setBrightness(br); // Bu, updateLeds'deki fade'i bozabilir
-                                // state.currentBrightness = br; // updateLeds zaten bunu yapacak
+
                              }
                         } else if (command == "setLedsOn") {
                              if(doc.containsKey("value")) {
                                 bool lightsOnCmd = doc["value"].as<bool>();
                                 if (state.lightsOn != lightsOnCmd) {
-                                     // Bu komut otomasyonu bypass etmeli mi?
-                                     // Şimdilik sadece state'i değiştirelim, updateLeds/updateSystemState
-                                     // bir sonraki döngüde durumu düzeltebilir veya bu manuel durumu koruyabiliriz.
-                                     // Manuel kontrol için ayrı bir state değişkeni eklemek daha iyi olabilir.
-                                     // Şimdilik sadece state'i değiştirelim:
+
                                      state.lightsOn = lightsOnCmd;
                                      addLog(String("Isiklar manuel (WS) ") + (state.lightsOn ? "AÇILDI" : "KAPATILDI"));
-                                     // Eğer manuel kontrol kalıcı olacaksa, motion timeout vs. devre dışı bırakılmalı.
-                                     // Şimdilik otomasyonun üzerine yazmasına izin veriyoruz.
-                                     // Eğer ışıklar manuel kapatıldıysa, belki lastMotionDetectedTime'ı sıfırlamak lazım?
+
                                      if (!state.lightsOn) {
-                                        state.lastMotionDetectedTime = 0; // Timeout'u hemen bitir
+                                        state.lastMotionDetectedTime = 0; 
                                      }
                                 }
                              }
@@ -2265,7 +2164,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
                         addLog("WS #" + String(client->id()) + ": Gelen mesaj JSON degil veya 'command' yok. Mesaj: " + message);
                     }
                 }
-            } // End Scope for AwsFrameInfo
+            } 
             break;
         case WS_EVT_PONG:
             // Serial.printf("WS PONG #%u\n", client->id());
@@ -2277,14 +2176,12 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
     }
 }
 
-// Mevcut durumu tüm bağlı WebSocket istemcilerine gönderir
+
 void sendWsUpdate() {
-    if (ws.count() == 0) return; // Bağlı istemci yoksa gönderme
+    if (ws.count() == 0) return; 
 
-    DynamicJsonDocument doc(1536); // handleGetStatus ile aynı boyutta olabilir
+    DynamicJsonDocument doc(1536); 
     doc["type"] = "status_update";
-
-    // Bağlantı & Sistem
     doc["wifiConnected"] = state.wifiConnected;
     doc["apMode"] = state.apMode;
     doc["ipAddress"] = state.apMode ? AP_IP.toString() : (state.wifiConnected ? WiFi.localIP().toString() : "N/A");
@@ -2294,7 +2191,6 @@ void sendWsUpdate() {
     doc["freeHeap"] = state.freeHeap;
     doc["otaPasswordSet"] = (strlen(OTA_PASSWORD) > 0);
 
-    // Sensörler & Durum
     doc["tslSensorOk"] = state.tslSensorOk;
     doc["currentLux"] = state.tslSensorOk ? String(state.currentLux, 1) : "HATA";
     doc["isEvening"] = state.isEvening;
@@ -2305,11 +2201,10 @@ void sendWsUpdate() {
     doc["estimatedDist"] = String(state.estimatedDistanceMeters, 1);
     doc["calibrationInvalid"] = state.calibrationInvalid;
 
-    // LED Durumu
     doc["lightsOn"] = state.lightsOn;
     doc["currentBrightness"] = state.currentBrightness;
     doc["currentLedPos"] = String(state.currentPositionLED, 1);
-    // LED state objesi
+   
     JsonObject ledState = doc.createNestedObject("leds");
     ledState["on"] = state.lightsOn;
     ledState["brightness"] = state.currentBrightness;
@@ -2318,54 +2213,50 @@ void sendWsUpdate() {
 
     String output;
     serializeJson(doc, output);
-    ws.textAll(output); // Tüm bağlı istemcilere gönder
+    ws.textAll(output); 
 }
 
 // ==================== YARDIMCI FONKSİYONLAR ====================
 
-// Değeri bir aralıktan diğerine haritalar (float)
 float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
     // Bölme sıfır hatasını önle
-    if (abs(in_max - in_min) < 1e-6) { // Çok küçük bir sayı (epsilon)
+    if (abs(in_max - in_min) < 1e-6) { 
         return out_min; // Veya ortalama (out_min + out_max) / 2.0f;
     }
     // Lineer haritalama formülü
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
-// WiFi bağlantısını kontrol eder ve gerekirse yeniden bağlanmayı dener
+
 void checkWifiConnection() {
      if (state.apMode) return; // AP modundaysa kontrol etme
 
      unsigned long currentMillis = millis();
-     // Bağlantı koptuysa ve yeniden bağlanma zamanı geldiyse
+
      if (WiFi.status() != WL_CONNECTED && currentMillis - state.lastReconnectAttempt > WIFI_RECONNECT_INTERVAL_MS) {
         addLog("WiFi baglantisi koptu, yeniden baglanma denemesi...");
         state.wifiConnected = false;
-        // OTA aktifiz ve WiFi koparsa, OTA'yı durdurmak gerekebilir mi? Şimdilik hayır.
+        
         state.lastReconnectAttempt = currentMillis;
-        WiFi.disconnect(); // Önce bağlantıyı kes
-        delay(100); // Kısa bekleme
-        WiFi.mode(WIFI_STA); // STA modunu tekrar ayarla (gerekli mi?)
-        WiFi.setHostname(HOSTNAME); // Hostname'i tekrar ayarla
-        WiFi.begin(config.wifi_ssid, config.wifi_password); // Kayıtlı bilgilerle tekrar dene
+        WiFi.disconnect(); 
+        delay(100); 
+        WiFi.mode(WIFI_STA); 
+        WiFi.setHostname(HOSTNAME); 
+        WiFi.begin(config.wifi_ssid, config.wifi_password); 
         Serial.print("Yeniden baglaniliyor");
      } else if (WiFi.status() != WL_CONNECTED && state.wifiConnected) {
-         // Henüz reconnect interval dolmadı ama bağlantı yok, durumu false yap
-         // Bu durum, loop içinde WiFi.status() her kontrol edildiğinde log spam yapabilir.
-         // Sadece interval dolduğunda log atmak daha iyi.
-         // state.wifiConnected = false; // Bunu yapmayalım, sadece interval'de log atalım.
-         if(Serial.availableForWrite()) { // Prevent blocking if Serial buffer is full
-             Serial.print("."); // Bağlanma sırasında nokta yazdırmaya devam et (çok sık yazdırmamaya dikkat)
+
+         if(Serial.availableForWrite()) { 
+             Serial.print("."); 
          }
      }
      else if (WiFi.status() == WL_CONNECTED && !state.wifiConnected) {
-         // Bağlantı başarılı oldu (ilk bağlantı veya yeniden bağlantı)
+        
          state.wifiConnected = true;
          IPAddress ip = WiFi.localIP();
          addLog("WiFi yeniden baglandi. IP: " + ip.toString());
          Serial.println("\nWiFi yeniden baglandi! IP: " + ip.toString());
-         // OTA'yı (yeniden) başlat
+         
          setupOTA();
      }
 }

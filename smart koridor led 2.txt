@@ -1,0 +1,1567 @@
+#define FASTLED_ALLOW_INTERRUPTS 0          // <-- #error mesajını engeller
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <Update.h>
+#include <ArduinoOTA.h>                     // <-- OTA header
+#include <FastLED.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <time.h>
+
+/*------------------- Pin Tanımlamaları ------------------------------------------------------------*/
+#define LED_PIN               5          // SK6812 data (GPIO‑5 → D5)
+#define SENSOR_DIGITAL_PIN    4          // Mikrodalga dijital (GPIO‑4 → D4)
+#define SENSOR_ANALOG_PIN    A0          // Mikrodalga analog (ADC1_CH0)
+#define NUM_LEDS            300          // LED adedi
+
+/*------------------- LED Türü ----------------------------------------------------------------------*/
+#define LED_TYPE            SK6812
+#define COLOR_ORDER         GRB
+
+/*------------------- Zaman / NTP -----------------------------------------------------------------*/
+#define GMT_OFFSET_SEC        (3 * 3600)          // UTC+3 (Türkiye)
+#define DAYLIGHT_OFFSET_SEC   0
+#define NTP_SYNC_INTERVAL    (6UL * 3600UL * 1000UL)   // 6 saat
+#define NTP_SERVER_1         "tr.pool.ntp.org"
+#define NTP_SERVER_2         "pool.ntp.org"
+#define NTP_SERVER_3         "time.google.com"
+
+/*------------------- Gündüz / Gece ---------------------------------------------------------------*/
+#define DAY_BRIGHTNESS       85            // % (gündüz)
+#define NIGHT_BRIGHTNESS     40            // % (gece)
+#define NIGHT_START_HOUR    23            // 23:00
+#define NIGHT_START_MINUTE   0
+#define NIGHT_END_HOUR       6            // 06:30
+#define NIGHT_END_MINUTE    30
+
+/*------------------- Genel Ayarlar ---------------------------------------------------------------*/
+#define DEFAULT_HOLD_TIME        20        // saniye
+#define DEFAULT_BRIGHTNESS       50        // %
+#define DEFAULT_SPEED            50        // %
+#define DEFAULT_ANIMATION         0        // 0 = SOLID
+#define DEFAULT_SENSITIVITY      80        // %
+#define DEFAULT_WIFI_SSID        "GulYig-1"
+#define DEFAULT_WIFI_PASSWORD    "Gy1916Cm19781979#*"
+#define OTA_PASSWORD             "12345678"
+#define RESTART_HOUR             2         // 02:00 planlı reboot
+#define RESTART_MINUTE           0
+#define MAX_RUN_TIME_MS   (3UL * 60UL * 1000UL)   // 3 dk maks. LED açık
+#define MOVEMENT_THRESHOLD       15        // analog eşik (ilk boot)
+
+/*------------------- Analogue Filtre ---------------------------------------------------------------*/
+#define ANALOG_READ_INTERVAL     10        // ms
+#define SAMPLE_BUFFER_SIZE       16        // ortalama / azami
+#define WIFI_RECONNECT_INTERVAL 30000      // 30 s
+
+/*------------------- EEPROM (Preferences) Anahtarları --------------------------------------------*/
+#define PREF_NS               "XIAO"
+#define KEY_ANIM             "anim"
+#define KEY_BRIGHT           "bright"
+#define KEY_SPEED            "speed"
+#define KEY_COLOR            "color"
+#define KEY_HOLD             "hold"
+#define KEY_SENS             "sens"
+#define KEY_THR              "thr"
+#define KEY_LAST_EPOCH       "lastt"
+#define KEY_LAST_MS          "lastm"
+
+/*========================================================================================================================*/
+/*  2. ENUM & GLOBAL DEĞİŞKENLER                                                                                     */
+/*========================================================================================================================*/
+
+enum Animation : uint8_t {
+  ANIM_SOLID      = 0,
+  ANIM_PULSE      = 1,
+  ANIM_THEATER    = 2,
+  ANIM_RAINBOW    = 3,
+  ANIM_SCANNER    = 4,
+  ANIM_COMET      = 5,
+  ANIM_METEOR     = 6,
+  ANIM_GRADIENT   = 7,
+  ANIM_FIRE       = 8,
+  ANIM_ZONES      = 9,
+  ANIM_AURORA     =10,
+  ANIM_MATRIX     =11,
+  ANIM_TWINKLE    =12,
+  ANIM_RIPPLES   =13,
+  ANIM_COUNT
+};
+
+/*------------------- LED dizisi (statik) ----------------------------------------------------------*/
+static CRGB leds[NUM_LEDS];
+
+/*------------------- Çalışma Durumları -----------------------------------------------------------*/
+static volatile bool    motionInterrupt = false;      // ISR flag
+static uint8_t         currentAnimation = DEFAULT_ANIMATION;
+static uint8_t         currentBrightness = DEFAULT_BRIGHTNESS;   // %
+static uint8_t         currentSpeed = DEFAULT_SPEED;            // %
+static uint32_t        currentColor = 0xFFFFFF;                // 24‑bit RGB
+static uint16_t        holdTimeMs = DEFAULT_HOLD_TIME * 1000;   // ms
+static uint8_t         sensitivity = DEFAULT_SENSITIVITY;       // %
+static uint16_t        movementThreshold = MOVEMENT_THRESHOLD; // analog eşik
+
+static bool            ledsActive = false;
+static unsigned long   ledsActivatedAt = 0;          // millis()
+static unsigned long   lastMotionTime = 0;          // millis()
+
+/*------------------- Analog Filtre ------------------------------------------------------------*/
+static uint16_t analogSamples[SAMPLE_BUFFER_SIZE];
+static uint8_t  sampleIdx = 0;
+static uint16_t analogAvg  = 0;
+static uint16_t analogMax  = 0;
+static bool     movementDetected = false;
+
+/*------------------- Kalibrasyon State ----------------------------------------------------------*/
+static bool     isCalibrating   = false;
+static unsigned long calStartMs = 0;
+static uint16_t noiseLevel     = 0;
+
+/*------------------- Diğer Global Objeler ------------------------------------------------------*/
+Preferences     preferences;
+AsyncWebServer server(80);
+bool            webServerStarted = false;
+bool            otaInProgress = false;
+static unsigned long movementStartTime = 0;
+
+/*=================== PROTOTİP İLANLARI ===============================*/
+void safeRestart(const char *reason);   // TimeMgr içinde kullanılacak
+void initWifi();                       // Wi‑Fi başlatıcı
+void initOTA();                        // OTA başlatıcı
+void startWebServer();                 // HTTP server
+void processSensor();                  // Sensör işleme – Core‑0
+void renderAnimation();                // Animasyon render – Core‑1
+
+/*========================================================================================================================*/
+/*  3. GAMA‑CORRECTION (8‑bit)                                                                                         */
+/*========================================================================================================================*/
+
+static const uint8_t PROGMEM gamma8tab[256] = {
+  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,1,1,1,1,1,2,2,3,3,4,5,5,6,7,8,9,10,12,13,15,16,19,20,23,25,28,30,34,37,41,
+  45,49,53,58,63,68,74,80,86,93,100,108,115,124,133,142,152,162,172,183,194,206,217,230,242,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255
+};
+static inline uint8_t gamma8(uint8_t v){ return pgm_read_byte(&gamma8tab[v]); }
+
+/*========================================================================================================================*/
+/*  4. ZAMAN & PARLAKLIK YÖNETİCİ (NTP, Gündüz/Gece, Planlı Restart)                                                */
+/*========================================================================================================================*/
+
+class TimeBrightness {
+private:
+  time_t epoch = 0;               // epoch (seconds)
+  bool   synced = false;
+  bool   nightMode = false;
+  uint8_t appliedBri = 0;         // % (0‑100)
+
+  unsigned long lastNtpSync = 0;
+  unsigned long lastBrightChk = 0;
+  unsigned long lastRestartChk = 0;
+
+  /*--- NTP sync (blocking, 8 s timeout) -------------------------------------------------*/
+  bool ntpSync() {
+    Serial.println("[Time] NTP sync denemesi …");
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+    unsigned long start = millis();
+    while (millis() - start < 8000) {
+      time_t now = time(nullptr);
+      if (now > 100000) {                // geçerli zaman
+        epoch   = now;
+        synced  = true;
+        Serial.printf("[Time] NTP OK: %s", ctime(&epoch));
+        return true;
+      }
+      delay(100);
+    }
+    Serial.println("[Time] NTP başarısız");
+    return false;
+  }
+
+  /*--- Dahili clock güncellemesi (millis → epoch) ----------------------------------------*/
+  void internalTick() {
+    static unsigned long lastMs = 0;
+    unsigned long curMs = millis();
+    unsigned long diff = curMs - lastMs;
+    if (diff >= 1000) {
+      epoch += diff / 1000;
+      lastMs += (diff / 1000) * 1000;
+    }
+  }
+
+  /*--- Gece kontrolü ---------------------------------------------------------------------*/
+  bool isNightNow(time_t t) const {
+    struct tm ti; localtime_r(&t,&ti);
+    int h = ti.tm_hour; int m = ti.tm_min;
+
+    // 23:00 – 06:30 arası gece
+    if (h > NIGHT_START_HOUR) return true;
+    if (h < NIGHT_END_HOUR)   return true;
+    if (h == NIGHT_START_HOUR && m >= NIGHT_START_MINUTE) return true;
+    if (h == NIGHT_END_HOUR   && m <  NIGHT_END_MINUTE)   return true;
+    return false;
+  }
+
+  /*--- Parlaklık uygula (gamma‑corr) ------------------------------------------------------*/
+  void applyBrightness() {
+    uint8_t target = nightMode ? NIGHT_BRIGHTNESS : DAY_BRIGHTNESS;
+    if (target != appliedBri) {
+      appliedBri = target;
+      FastLED.setBrightness(gamma8(target * 255 / 100));
+      Serial.printf("[Bright] %s modu → %d%%\n", nightMode?"Gece":"Gündüz", target);
+    }
+  }
+
+  /*--- Planlı reboot (02:00) ------------------------------------------------------------*/
+  void checkRestart() {
+    if (lastRestartChk && (millis() - lastRestartChk) < 1000) return; // debounce 1 s
+    struct tm ti; localtime_r(&epoch,&ti);
+    if (ti.tm_hour == RESTART_HOUR && ti.tm_min == RESTART_MINUTE) {
+      lastRestartChk = millis();                // bir kez çalıştır
+      Serial.println("[Sys] Planlı reboot (02:00) – 5 s bekleniyor");
+      delay(5000);
+      safeRestart("scheduled 02:00");
+    }
+  }
+
+public:
+  void begin() {
+    Serial.println("[Time] Başlatılıyor …");
+    preferences.begin(PREF_NS, false);
+    epoch = (time_t)preferences.getULong(KEY_LAST_EPOCH, 0);
+    unsigned long storedMs = preferences.getULong(KEY_LAST_MS, 0);
+    if (epoch && storedMs) {
+      unsigned long nowMs = millis();
+      unsigned long delta = nowMs - storedMs;
+      epoch += delta / 1000;
+      Serial.printf("[Time] Önceki zaman yüklendi: %s", ctime(&epoch));
+    }
+    // İlk deneme NTP (Wi‑Fi varsa)
+    if (WiFi.isConnected()) ntpSync();
+    else Serial.println("[Time] Wi‑Fi yok – offline zaman");
+
+    nightMode = isNightNow(epoch);
+    applyBrightness();
+
+    lastNtpSync   = millis();
+    lastBrightChk = millis();
+  }
+
+  void loop() {
+    internalTick();
+
+    // Periyodik NTP sync
+    if (WiFi.isConnected() && (long)(millis() - lastNtpSync) >= (long)NTP_SYNC_INTERVAL)
+      if (ntpSync()) lastNtpSync = millis();
+
+    // Parlaklık kontrol (her 1 dakika)
+    if ((long)(millis() - lastBrightChk) >= 60000) {
+      bool nowNight = isNightNow(epoch);
+      if (nowNight != nightMode) {
+        nightMode = nowNight;
+        applyBrightness();
+      }
+      lastBrightChk = millis();
+    }
+
+    // Planlı reboot
+    checkRestart();
+  }
+
+  time_t now() const { return epoch; }
+  bool   isNight() const { return nightMode; }
+  uint8_t currentTargetBri() const { return nightMode ? NIGHT_BRIGHTNESS : DAY_BRIGHTNESS; }
+
+  /*--- Shutdown (reboot öncesi) ----------------------------------------------------------*/
+  void saveState() {
+    preferences.putULong(KEY_LAST_EPOCH, (unsigned long)epoch);
+    preferences.putULong(KEY_LAST_MS,    millis());
+  }
+};
+
+TimeBrightness TimeMgr;
+
+/*========================================================================================================================*/
+/*  5. WIFI, OTA ve Web‑Server                                                                                           */
+/*========================================================================================================================*/
+
+void initWifi() {
+  Serial.printf("[WiFi] Bağlanıyor: %s …\n", DEFAULT_WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 12000) {
+    delay(300);
+    Serial.print(".");
+  }
+  if (WiFi.isConnected()) {
+    Serial.println("\n[WiFi] Bağlandı");
+    Serial.print("[WiFi] IP: "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n[WiFi] Bağlantı başarısız – offline mod");
+  }
+}
+
+/*--- OTA (HTTP POST) --------------------------------------------------------------------*/
+void initOTA() {
+  ArduinoOTA.setPort(3232);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([](){
+    otaInProgress = true;
+    Serial.println("[OTA] Başlatıldı");
+  });
+  ArduinoOTA.onEnd([](){
+    otaInProgress = false;
+    Serial.println("[OTA] Tamamlandı – reboot");
+    delay(500);
+    safeRestart("OTA finish");
+  });
+  ArduinoOTA.onError([](ota_error_t err){
+    otaInProgress = false;
+    Serial.printf("[OTA] Hata %u\n", err);
+  });
+  ArduinoOTA.begin();
+}
+
+/*--- Web‑UI (HTML) ----------------------------------------------------------------------*/
+static const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>XIAO LED Kontrol Paneli</title>
+
+    <link rel="preconnect" href="https://cdn.jsdelivr.net">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+
+    <style>
+        :root {
+            --bg-primary: #0b1020;
+            --bg-secondary: #141b34;
+            --card-bg: rgba(22, 28, 52, 0.92);
+            --accent: #4f8cff;
+            --accent-hover: #6aa0ff;
+            --text-primary: #f4f7ff;
+            --text-secondary: #b9c4e2;
+            --border: rgba(255, 255, 255, 0.08);
+            --success: #22c55e;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+        }
+
+        body {
+            background: radial-gradient(circle at top, #1b2550 0%, #0b1020 45%, #060914 100%);
+            color: var(--text-primary);
+            font-family: Inter, Arial, sans-serif;
+            min-height: 100vh;
+        }
+
+        .main-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            backdrop-filter: blur(18px);
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+        }
+
+        .nav-tabs {
+            border-bottom: 1px solid var(--border);
+        }
+
+        .nav-tabs .nav-link {
+            color: var(--text-secondary);
+            border: none;
+            border-radius: 14px;
+            margin-right: 8px;
+        }
+
+        .nav-tabs .nav-link.active {
+            background: linear-gradient(135deg, var(--accent), #7c4dff);
+            color: white;
+        }
+
+        .form-control,
+        .form-select,
+        .form-range {
+            background-color: rgba(255,255,255,0.06);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+        }
+
+        /* AÇILIR MENÜ SEÇENEKLERİ İÇİN EKLENEN KISIM (AÇIK MAVİ ARKA PLAN) */
+        .form-select option {
+            background-color: #e0f2fe; /* Açık mavi arka plan */
+            color: #0b1020; /* Okunabilirlik için koyu renk metin */
+        }
+
+        .form-control:focus,
+        .form-select:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 0.25rem rgba(79, 140, 255, 0.2);
+        }
+
+        .status-box {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 1rem;
+        }
+
+        .metric {
+            font-size: 0.95rem;
+            color: var(--text-secondary);
+        }
+
+        .metric strong {
+            color: var(--text-primary);
+        }
+
+        .btn-accent {
+            background: linear-gradient(135deg, var(--accent), #7c4dff);
+            border: none;
+            color: white;
+        }
+
+        .btn-accent:hover {
+            background: linear-gradient(135deg, var(--accent-hover), #9066ff);
+            color: white;
+        }
+    </style>
+</head>
+<body>
+<div class="container py-4">
+    <div class="row justify-content-center">
+        <div class="col-12 col-lg-10 col-xl-9">
+            <div class="main-card p-4 p-md-5">
+                <div class="text-center mb-4">
+                    <h2><i class="fas fa-lightbulb me-2"></i>Koridor LED Kontrol</h2>
+                    <p class="text-secondary mb-0">XIAO ESP32-S3 Akıllı Aydınlatma Sistemi</p>
+                </div>
+
+                <div id="status" class="status-box mb-4">Durum bilgileri yükleniyor...</div>
+
+                <ul class="nav nav-tabs mb-4" role="tablist">
+                    <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#animTab" type="button">Animasyon</button></li>
+                    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#sensorTab" type="button">Sensör</button></li>
+                    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#systemTab" type="button">Sistem</button></li>
+                </ul>
+
+                <div class="tab-content">
+                    <div class="tab-pane fade show active" id="animTab">
+                        <div class="row g-4">
+                            <div class="col-md-6">
+                                <label for="animSel" class="form-label">Animasyon Modu</label>
+                                <select id="animSel" class="form-select"></select>
+                            </div>
+                            <div class="col-md-6">
+                                <label for="colPick" class="form-label">Ana Renk</label>
+                                <input id="colPick" type="color" class="form-control form-control-color w-100" value="#ffffff">
+                            </div>
+                            <div class="col-md-6">
+                                <label for="briSlider" class="form-label">Parlaklık: <span id="briVal">50</span>%</label>
+                                <input id="briSlider" type="range" class="form-range" min="1" max="100" value="50">
+                            </div>
+                            <div class="col-md-6">
+                                <label for="spdSlider" class="form-label">Hız: <span id="spdVal">50</span>%</label>
+                                <input id="spdSlider" type="range" class="form-range" min="1" max="100" value="50">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="tab-pane fade" id="sensorTab">
+                        <div class="row g-4">
+                            <div class="col-md-6">
+                                <label for="sensSlider" class="form-label">Hassasiyet: <span id="sensVal">50</span>%</label>
+                                <input id="sensSlider" type="range" class="form-range" min="0" max="100" value="50">
+                            </div>
+                            <div class="col-md-6">
+                                <label for="holdSlider" class="form-label">Bekleme Süresi: <span id="holdVal">15</span> sn</label>
+                                <input id="holdSlider" type="range" class="form-range" min="5" max="300" value="15">
+                            </div>
+                        </div>
+                        <div class="mt-4 d-grid">
+                            <button id="calBtn" class="btn btn-accent" type="button">
+                                <i class="fas fa-sliders me-2"></i>Sensör Kalibrasyonu Başlat
+                            </button>
+                            <div id="calStatus" class="mt-3 text-center"></div>
+                        </div>
+                    </div>
+
+                    <div class="tab-pane fade" id="systemTab">
+                        <div class="row g-3">
+                            <div class="col-md-6"><div class="status-box"><div class="metric">IP Adresi<br><strong>%IPADDRESS%</strong></div></div></div>
+                            <div class="col-md-6"><div class="status-box"><div class="metric">Boş RAM<br><strong>%FREEHEAP% KB</strong></div></div></div>
+                        </div>
+                        <div class="d-grid mt-4">
+                            <a href="/ota" class="btn btn-success btn-lg">
+                                <i class="fas fa-upload me-2"></i>OTA Güncelleme
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+'use strict';
+
+const el = {
+    animSel: document.getElementById('animSel'),
+    colPick: document.getElementById('colPick'),
+    briSlider: document.getElementById('briSlider'),
+    briVal: document.getElementById('briVal'),
+    spdSlider: document.getElementById('spdSlider'),
+    spdVal: document.getElementById('spdVal'),
+    sensSlider: document.getElementById('sensSlider'),
+    sensVal: document.getElementById('sensVal'),
+    holdSlider: document.getElementById('holdSlider'),
+    holdVal: document.getElementById('holdVal'),
+    status: document.getElementById('status'),
+    calBtn: document.getElementById('calBtn'),
+    calStatus: document.getElementById('calStatus')
+};
+
+const animations =[
+    '🔵 Düz Renk', '💨 Nefes', '🎭 Tiyatro', '🌈 Gökkuşağı',
+    '🔦 Tarayıcı', '☄️ Kuyruklu Yıldız', '🌠 Meteor', '🌊 Dalga',
+    '🔥 Ateş', '🔶 Bölge', '🌌 Aurora', '🟢 Matrix',
+    '✨ Parıltı', '💧 Ripple'
+];
+
+const populateAnimations = () => {
+    el.animSel.innerHTML = animations
+        .map((name, index) => `<option value="${index}">${name}</option>`)
+        .join('');
+};
+
+const apiGet = async (url) => {
+    const response = await fetch(url, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.json();
+};
+
+const apiSet = async (endpoint, value) => {
+    const response = await fetch(`${endpoint}?value=${encodeURIComponent(value)}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response;
+};
+
+const updateLabels = () => {
+    el.briVal.textContent = el.briSlider.value;
+    el.spdVal.textContent = el.spdSlider.value;
+    el.sensVal.textContent = el.sensSlider.value;
+    el.holdVal.textContent = el.holdSlider.value;
+};
+
+const updateStatus = async () => {
+    try {
+        const d = await apiGet('/api/status');
+
+        el.status.innerHTML = `
+            <div class="row g-3 text-center">
+                <div class="col-md-4">LED Durumu<br><span class="badge bg-${d.ledsActive ? 'success' : 'danger'}">${d.ledsActive ? 'Aktif' : 'Pasif'}</span></div>
+                <div class="col-md-4">Sensör<br><strong>${d.sensorValue ?? 0}</strong></div>
+                <div class="col-md-4">Eşik<br><strong>${d.threshold ?? 0}</strong></div>
+            </div>`;
+
+        el.animSel.value = d.animation ?? 0;
+        el.colPick.value = '#' + Number(d.color ?? 0xFFFFFF).toString(16).padStart(6, '0');
+        el.briSlider.value = d.brightness ?? 50;
+        el.spdSlider.value = d.speed ?? 50;
+        el.sensSlider.value = d.sensitivity ?? 50;
+        el.holdSlider.value = d.holdTime ?? 15;
+
+        updateLabels();
+    } catch (error) {
+        el.status.innerHTML = `<div class="alert alert-danger mb-0">Bağlantı hatası: ${error.message}</div>`;
+    }
+};
+
+const bindControls = () => {
+    el.animSel.addEventListener('change', () => apiSet('/api/anim', el.animSel.value));
+    el.colPick.addEventListener('input', () => apiSet('/api/color', el.colPick.value.substring(1)));
+
+    [
+        [el.briSlider, '/api/brightness'],[el.spdSlider, '/api/speed'],
+        [el.sensSlider, '/api/sensitivity'],[el.holdSlider, '/api/holdtime']
+    ].forEach(([slider, endpoint]) => {
+        slider.addEventListener('input', () => {
+            updateLabels();
+            apiSet(endpoint, slider.value).catch(console.error);
+        });
+    });
+
+    el.calBtn.addEventListener('click', async () => {
+        try {
+            el.calStatus.innerHTML = '<span class="text-info">Kalibrasyon başlatıldı...</span>';
+            const response = await fetch('/api/calibrate');
+            if (!response.ok) throw new Error('Kalibrasyon isteği başarısız');
+
+            setTimeout(async () => {
+                el.calStatus.innerHTML = '<span class="text-success">Kalibrasyon tamamlandı.</span>';
+                await updateStatus();
+            }, 10000);
+        } catch (error) {
+            el.calStatus.innerHTML = `<span class="text-danger">${error.message}</span>`;
+        }
+    });
+};
+
+window.addEventListener('load', async () => {
+    populateAnimations();
+    bindControls();
+    await updateStatus();
+    setInterval(updateStatus, 2000);
+});
+</script>
+</body>
+</html>
+)rawliteral";
+
+/*--- OTA Sayfası --------------------------------------------------------------------------*/
+static const char ota_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OTA Güncelleme</title>
+
+    <link rel="preconnect" href="https://cdn.jsdelivr.net">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+
+    <style>
+        :root {
+            --bg-primary: #0b1020;
+            --card-bg: rgba(22, 28, 52, 0.92);
+            --accent: #4f8cff;
+            --text-primary: #f4f7ff;
+            --text-secondary: #b9c4e2;
+            --border: rgba(255, 255, 255, 0.08);
+        }
+        
+        body {
+            background: radial-gradient(circle at top, #1b2550 0%, #0b1020 45%, #060914 100%);
+            color: var(--text-primary);
+            font-family: Inter, Arial, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            align-items: center; /* Dikeyde ortalama */
+        }
+
+        .main-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            backdrop-filter: blur(18px);
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+            padding: 2.5rem;
+        }
+
+        .form-control {
+            background-color: rgba(255,255,255,0.06);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+        }
+
+        .form-control:focus {
+            background-color: rgba(255,255,255,0.08);
+            border-color: var(--accent);
+            color: var(--text-primary);
+            box-shadow: 0 0 0 0.25rem rgba(79, 140, 255, 0.2);
+        }
+
+        /* Dosya Seç butonu renk ayarı */
+        .form-control::file-selector-button {
+            background-color: rgba(255,255,255,0.1);
+            color: var(--text-primary);
+            border: none;
+            border-right: 1px solid var(--border);
+            margin-right: 1rem;
+        }
+
+        .btn-accent {
+            background: linear-gradient(135deg, var(--accent), #7c4dff);
+            border: none;
+            color: white;
+        }
+
+        .btn-accent:hover {
+            background: linear-gradient(135deg, #6aa0ff, #9066ff);
+            color: white;
+        }
+
+        .btn-outline-custom {
+            color: var(--text-secondary);
+            border: 1px solid var(--border);
+        }
+
+        .btn-outline-custom:hover {
+            background-color: rgba(255,255,255,0.1);
+            color: white;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="row justify-content-center">
+        <div class="col-12 col-md-8 col-lg-6">
+            <div class="main-card text-center">
+                
+                <div class="mb-4">
+                    <i class="fas fa-microchip fa-3x text-primary mb-3" style="color: var(--accent) !important;"></i>
+                    <h3 class="fw-bold">Firmware Güncelleme</h3>
+                    <p class="text-secondary small">Cihaz yazılımını güncellemek için <strong>.bin</strong> uzantılı güncel dosyayı seçin. İşlem sırasında cihazın gücünü kesmeyin.</p>
+                </div>
+
+                <form id="updForm" method="POST" action="/doUpdate" enctype="multipart/form-data">
+                    <input class="form-control form-control-lg mb-4" type="file" name="update" id="fileInput" accept=".bin">
+                    
+                    <div class="d-grid gap-3">
+                        <button type="submit" class="btn btn-accent btn-lg">
+                            <i class="fas fa-cloud-upload-alt me-2"></i>Yükle ve Yeniden Başlat
+                        </button>
+                        <a href="/" class="btn btn-outline-custom btn-lg">
+                            <i class="fas fa-arrow-left me-2"></i>Ana Ekrana Dön
+                        </a>
+                    </div>
+                </form>
+
+                <div id="msg" class="mt-4"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const updForm = document.getElementById('updForm');
+    const msgDiv = document.getElementById('msg');
+    const fileInput = document.getElementById('fileInput');
+
+    updForm.addEventListener('submit', (e) => {
+        const file = fileInput.files[0];
+        
+        if (!file) {
+            e.preventDefault();
+            msgDiv.innerHTML = '<div class="alert alert-warning border-0 shadow-sm"><i class="fas fa-exclamation-triangle me-2"></i>Lütfen bir dosya seçin!</div>';
+            return;
+        }
+        
+        msgDiv.innerHTML = '<div class="alert alert-info border-0 shadow-sm"><i class="fas fa-spinner fa-spin me-2"></i>Dosya yükleniyor, lütfen bekleyin... Cihaz yeniden başlatılacak.</div>';
+    });
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+/*--- API Handler --------------------------------------------------------------------------*/
+void handleApi(AsyncWebServerRequest *req) {
+  String p = req->url();
+
+  /*--- Animasyon seçimi -----------------------------------------------------------*/
+  if (p.startsWith("/api/anim") && req->hasParam("value")) {
+    currentAnimation = constrain(req->getParam("value")->value().toInt(), 0, ANIM_COUNT-1);
+    preferences.putUChar(KEY_ANIM, currentAnimation);
+    req->send(200,"text/plain","OK");
+    return;
+  }
+
+  /*--- Parlaklık ---------------------------------------------------------------*/
+  if (p.startsWith("/api/brightness") && req->hasParam("value")) {
+    currentBrightness = constrain(req->getParam("value")->value().toInt(),0,100);
+    FastLED.setBrightness(gamma8(currentBrightness*255/100));
+    preferences.putUChar(KEY_BRIGHT, currentBrightness);
+    req->send(200,"text/plain","OK");
+    return;
+  }
+
+  /*--- Hız ----------------------------------------------------------------------*/
+  if (p.startsWith("/api/speed") && req->hasParam("value")) {
+    currentSpeed = constrain(req->getParam("value")->value().toInt(),0,100);
+    preferences.putUChar(KEY_SPEED, currentSpeed);
+    req->send(200,"text/plain","OK");
+    return;
+  }
+
+  /*--- Renk ---------------------------------------------------------------------*/
+  if (p.startsWith("/api/color") && req->hasParam("value")) {
+    String hex = req->getParam("value")->value();
+    currentColor = strtoul(hex.c_str(), nullptr, 16);
+    preferences.putULong(KEY_COLOR, currentColor);
+    req->send(200,"text/plain","OK");
+    return;
+  }
+
+  /*--- Hold‑time ---------------------------------------------------------------*/
+  if (p.startsWith("/api/holdtime") && req->hasParam("value")) {
+    holdTimeMs = constrain(req->getParam("value")->value().toInt(),5,60) * 1000UL;
+    preferences.putUShort(KEY_HOLD, holdTimeMs/1000);
+    req->send(200,"text/plain","OK");
+    return;
+  }
+
+  /*--- Sensitivity --------------------------------------------------------------*/
+  if (p.startsWith("/api/sensitivity") && req->hasParam("value")) {
+    sensitivity = constrain(req->getParam("value")->value().toInt(),0,100);
+    movementThreshold = map(sensitivity,0,100,10,50);
+    preferences.putUChar(KEY_SENS, sensitivity);
+    preferences.putUShort(KEY_THR, movementThreshold);
+    req->send(200,"text/plain","OK");
+    return;
+  }
+
+  /*--- Kalibrasyon --------------------------------------------------------------*/
+  if (p.startsWith("/api/calibrate")) {
+    if (!isCalibrating) {
+      isCalibrating   = true;
+      calStartMs      = millis();
+      noiseLevel      = 0;
+      req->send(200,"text/plain","Kalibrasyon başladı (10 s)…");
+    } else {
+      req->send(200,"text/plain","Kalibrasyon zaten çalışıyor");
+    }
+    return;
+  }
+
+  /*--- Durum (JSON) --------------------------------------------------------------*/
+  if (p.startsWith("/api/status")) {
+    StaticJsonDocument<512> doc;
+    doc["animation"]   = currentAnimation;
+    doc["brightness"]  = currentBrightness;
+    doc["speed"]       = currentSpeed;
+    doc["color"]       = currentColor;
+    doc["holdTime"]    = holdTimeMs/1000;
+    doc["sensitivity"]= sensitivity;
+    doc["lastMotion"] = lastMotionTime;
+    doc["ledsActive"] = ledsActive;
+    doc["sensorValue"]= analogMax;
+    doc["threshold"]  = movementThreshold;
+    String out; serializeJson(doc,out);
+    req->send(200,"application/json",out);
+    return;
+  }
+
+  req->send(404,"text/plain","Not Found");
+}
+
+/*--- OTA POST (binary) --------------------------------------------------------------------*/
+void handleDoUpdate(AsyncWebServerRequest *req, const String& filename,
+                    size_t index, uint8_t *data, size_t len, bool final) {
+  if (!index) {
+    otaInProgress = true;
+    Serial.println("[OTA] Update başladı …");
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Update.printError(Serial);
+      otaInProgress = false; return;
+    }
+  }
+  if (len) {
+    if (Update.write(data, len) != len) {
+      Update.printError(Serial);
+      otaInProgress = false; return;
+    }
+  }
+  if (final) {
+    if (Update.end(true)) {
+      Serial.println("[OTA] Update tamamlandı – reboot");
+      req->send(200,"text/plain","Update OK – reboot");
+      delay(500);
+      safeRestart("OTA finish");
+    } else {
+      Update.printError(Serial);
+      req->send(500,"text/plain","Update FAILED");
+      otaInProgress = false;
+    }
+  }
+}
+
+/*--- Web‑Server Başlat --------------------------------------------------------------*/
+void startWebServer() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *req){
+    String html = index_html;
+    html.replace("%IPADDRESS%", WiFi.localIP().toString());
+    html.replace("%FREEHEAP%", String(ESP.getFreeHeap() / 1024));
+    req->send(200,"text/html", html);
+  });
+
+  server.on("/ota", HTTP_GET, [](AsyncWebServerRequest *req){
+    req->send(200,"text/html", ota_html);
+  });
+
+  server.on("/doUpdate", HTTP_POST, [](AsyncWebServerRequest *req){},
+            handleDoUpdate);
+
+  server.onNotFound(handleApi);   // /api/* yönlendirmesi
+  server.begin();
+  webServerStarted = true;
+  Serial.println("[Web] Sunucu başlatıldı");
+}
+
+/*========================================================================================================================*/
+/*  6. KALIBRASYON (10 s – ortalama / maksimum)                                                                      */
+/*========================================================================================================================*/
+
+void handleCalibration() {
+  if (!isCalibrating) return;                // hiçbir şey yoksa çık
+
+  unsigned long now = millis();
+  // 10 s boyunca en yüksek gerçel değeri al
+  if (now - calStartMs < 10000) {
+    if (analogMax > noiseLevel) noiseLevel = analogMax;
+    return;
+  }
+
+  // 10 s doldu → eşik değeri hesapla, kalibrasyonu kapat
+  isCalibrating   = false;
+  float factor = 1.1f;                      // %10 güvenlik marjı
+  uint16_t newThr = constrain((uint16_t)(noiseLevel * factor + 0.5f), 10, 4095);
+  movementThreshold = newThr;
+  sensitivity = map(newThr, 10, 4095, 100, 0);   // yüksek eşik = düşük hassasiyet
+  preferences.putUShort(KEY_THR, movementThreshold);
+  preferences.putUChar (KEY_SENS, sensitivity);
+  Serial.printf("[Calib] Noise=%u → yeni eşik=%u, hassas=%u%%\n",
+                noiseLevel, movementThreshold, sensitivity);
+}
+
+/*========================================================================================================================*/
+/*  7. SENSÖR (IRQ + Analog) – Hareket Algılama, Hold‑time, Maksimum Çalışma Süresi -------------------------------*/
+/*========================================================================================================================*/
+
+void IRAM_ATTR motionISR() {
+  static unsigned long lastUs = 0;
+  unsigned long nowUs = micros();
+  if (nowUs - lastUs > 50000) {          // 50 µs debounce
+    motionInterrupt = true;
+    lastUs = nowUs;
+  }
+}
+
+/*--- Analog okuma ---------------------------------------------------------------*/
+void readAnalog() {
+  static unsigned long lastMs = 0;
+  if (millis() - lastMs < ANALOG_READ_INTERVAL) return;
+  lastMs = millis();
+
+  uint16_t val = analogRead(SENSOR_ANALOG_PIN);
+  analogSamples[sampleIdx++] = val;
+  if (sampleIdx >= SAMPLE_BUFFER_SIZE) sampleIdx = 0;
+
+  uint32_t sum = 0;
+  analogMax = 0;
+  for (uint8_t i=0;i<SAMPLE_BUFFER_SIZE;i++) {
+    sum += analogSamples[i];
+    if (analogSamples[i] > analogMax) analogMax = analogSamples[i];
+  }
+  analogAvg = sum / SAMPLE_BUFFER_SIZE;
+
+  bool nowMoving = (analogMax > movementThreshold) &&
+                   (analogMax > analogAvg * 1.3f);
+
+  if (nowMoving && !movementDetected) {
+    movementDetected = true;
+    movementStartTime = millis();
+    lastMotionTime    = millis();
+    if (!ledsActive) {
+      ledsActive      = true;
+      ledsActivatedAt = millis();
+      Serial.println("[Sensor] LED aktif (analog)");
+    }
+  } else if (!nowMoving && movementDetected) {
+    movementDetected = false;
+  }
+}
+
+/*--- Sensör İşleme (Core‑0) ------------------------------------------------------*/
+void processSensor() {
+  /* Dijital (IRQ) */
+  if (motionInterrupt) {
+    motionInterrupt = false;
+    if (analogMax > movementThreshold/2) {
+      lastMotionTime = millis();
+      if (!ledsActive) {
+        ledsActive = true;
+        ledsActivatedAt = millis();
+        Serial.println("[Sensor] LED aktif (IRQ)");
+      }
+    }
+  }
+
+  /* Analog */
+  readAnalog();
+
+  /* Kalibrasyon durumu (10 s sonrası) */
+  handleCalibration();
+
+  /* Maksimum çalışma süresi (3 dk) */
+  if (ledsActive && (millis() - ledsActivatedAt) > MAX_RUN_TIME_MS) {
+    ledsActive = false;
+    fill_solid(leds, NUM_LEDS, CRGB::Black);
+    FastLED.show();
+    Serial.println("[Safety] 3 dk limit aşıldı – LED kapatıldı");
+  }
+
+  /* Hold‑time: hareket yoksa LED söndür */
+  if (ledsActive && !movementDetected && (millis() - lastMotionTime) > holdTimeMs) {
+    ledsActive = false;
+    fill_solid(leds, NUM_LEDS, CRGB::Black);
+    FastLED.show();
+    Serial.println("[Sensor] Hold timeout – LED kapandı");
+  }
+}
+
+/*========================================================================================================================*/
+/*  9. ANİMASYON MOTORU – Noise‑tabanlı ve klasik efektler (Core‑1)                                                   */
+/*========================================================================================================================*/
+#ifndef FASTLED_ALLOW_INTERRUPTS
+  #error "FASTLED_ALLOW_INTERRUPTS tanımlanmalı (0 olarak)"
+#endif
+
+#if FASTLED_ALLOW_INTERRUPTS != 0
+  #error "FASTLED_ALLOW_INTERRUPTS 0 olmalı (interrupt'lar devre dışı)"
+#endif "FastLED interrupt ayarı kapatılmalı (FastLED_ALLOW_INTERRUPTS) – yoksa ISR içinde LED güncellenmez"
+
+/*--- Noise yardımcıları ----------------------------------------------------------------------*/
+static inline uint8_t fastNoise8(uint16_t x, uint16_t y) {
+  return inoise8(x, y);
+}
+
+/*--- 1) Solid (düz renk) ----------------------------------------------------------------------*/
+void animSolid() {
+  fill_solid(leds, NUM_LEDS, currentColor);
+}
+
+/*--- 2) Pulse (nefes) --------------------------------------------------------------------------*/
+void animPulse() {
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  uint32_t interval = 30 - currentSpeed;   // hız arttıkça interval azalır
+  if (interval < 8) interval = 8;
+  if (now - last < interval) return;
+  last = now;
+
+  uint8_t wave = sin8(now >> 2);
+  uint8_t bright = scale8(wave, currentBrightness * 2.55);
+  fill_solid(leds, NUM_LEDS, currentColor);
+  FastLED.setBrightness(bright);
+}
+
+/*--- 3) Theater Chase --------------------------------------------------------------------------*/
+void animTheater() {
+  static uint32_t last = 0;
+  static uint8_t j = 0;
+  uint32_t now = millis();
+  uint32_t delayMs = max(10, 120 - currentSpeed * 2);
+  if (now - last < delayMs) return;
+  last = now;
+  j++;
+
+  CHSV hsv = rgb2hsv_approximate(currentColor);
+  CHSV hsv2 = hsv; hsv2.h += 32;
+
+  for (int i = 0; i < NUM_LEDS; i++) {
+    uint8_t pat = (i + j) % 6;
+    if (pat < 2) leds[i] = CHSV(hsv.h, 255, qmul8((uint8_t)(currentBrightness * 2.55), 200));
+    else if (pat < 4) leds[i] = CHSV(hsv2.h, 200, qmul8((uint8_t)(currentBrightness * 2.55), 160));
+    else leds[i] = CRGB::Black;
+  }
+}
+
+/*--- 4) Rainbow --------------------------------------------------------------------------------*/
+void animRainbow() {
+  static uint32_t last = 0;
+  static uint16_t hueBase = 0;
+  uint32_t now = millis();
+  if (now - last < max(4, 40 - currentSpeed)) return;
+  last = now;
+  hueBase += 2 + (currentSpeed / 8);
+  for (int i = 0; i < NUM_LEDS; i++) {
+    uint8_t hue = hueBase + (i * 256 / max(1, NUM_LEDS / 2));
+    uint8_t sat = 220 - (sin8(i * 2 + (now >> 4)) / 4);
+    uint8_t val = qmul8((uint8_t)(currentBrightness * 2.55), 255);
+    leds[i] = CHSV(hue, sat, val);
+  }
+}
+
+/*--- 5) Larson Scanner (Kuyruklu ışık) ----------------------------------------------------------*/
+void animScanner() {
+  static uint32_t last = 0;
+  static int8_t dir = 1;
+  static int16_t pos = 0;
+  uint32_t now = millis();
+  if (now - last < max(4, 50 - currentSpeed)) return;
+  last = now;
+
+  CHSV base = rgb2hsv_approximate(currentColor);
+  for (int i = 0; i < NUM_LEDS; i++) leds[i].nscale8_video(250);   // solukluk
+
+  pos += dir;
+  if (pos >= NUM_LEDS - 1) dir = -1;
+  if (pos <= 0) dir = 1;
+
+  leds[pos] = CHSV(base.h, 255, currentBrightness * 2.55);
+  if (pos > 0)     leds[pos-1] = CHSV(base.h, 200, (int)(currentBrightness * 2.55 * 0.6));
+  if (pos < NUM_LEDS-1) leds[pos+1] = CHSV(base.h, 200, (int)(currentBrightness * 2.55 * 0.6));
+  if (pos > 1)     leds[pos-2].nscale8_video(150);
+  if (pos < NUM_LEDS-2) leds[pos+2].nscale8_video(150);
+}
+
+/*--- 6) Comet ---------------------------------------------------------------------------------*/
+void animComet() {
+  static uint32_t last = 0;
+  static uint16_t pos = 0;
+  uint32_t now = millis();
+  if (now - last < max(6, 40 - currentSpeed)) return;
+  last = now;
+  uint8_t tailLen = constrain(4 + currentSpeed / 4, 4, 24);
+  for (int i = 0; i < NUM_LEDS; i++) leds[i].nscale8_video(240);
+  pos = (pos + 1) % NUM_LEDS;
+  leds[pos] = currentColor;
+  for (int t = 1; t <= tailLen; t++) {
+    int idx = pos - t;
+    if (idx < 0) idx += NUM_LEDS;
+    uint8_t fade = 255 - (uint8_t)((255.0 * t) / tailLen);
+    CRGB c = currentColor;
+    c.nscale8_video(fade);
+    leds[idx] = leds[idx] + c;
+    leds[idx].nscale8_video(220 - min(200, t * 6));
+  }
+  FastLED.setBrightness(currentBrightness * 2.55);
+}
+
+/*--- 7) Meteor Rain (yağmur) -------------------------------------------------------------------*/
+void animMeteor() {
+  static uint32_t last = 0;
+  static uint16_t step = 0;
+  static int meteorPos[6] = {-1,-1,-1,-1,-1,-1};
+  static int meteorLen[6];
+  static uint8_t meteorHue[6];
+  uint32_t now = millis();
+  if (now - last < max(8, 70 - currentSpeed)) return;
+  last = now;
+  fadeToBlackBy(leds, NUM_LEDS, 40);
+  if (random8() < (50 + currentSpeed)) {
+    for (int m = 0; m < 6; m++) {
+      if (meteorPos[m] == -1) {
+        meteorPos[m] = random16(NUM_LEDS);
+        meteorLen[m] = random8(6, 24);
+        meteorHue[m] = random8();
+        break;
+      }
+    }
+  }
+  for (int m = 0; m < 6; m++) {
+    if (meteorPos[m] >= 0) {
+      meteorPos[m] = (meteorPos[m] + 1) % NUM_LEDS;
+      for (int t = 0; t < meteorLen[m]; t++) {
+        int idx = meteorPos[m] - t;
+        if (idx < 0) idx += NUM_LEDS;
+        uint8_t bright = 255 - ((255 * t) / meteorLen[m]);
+        leds[idx] += CHSV(meteorHue[m], 240, qmul8((uint8_t)bright, (uint8_t)(currentBrightness * 2.55)));
+      }
+      if (random8() < 20) {
+        int g = (meteorPos[m] + random8(6)) % NUM_LEDS;
+        leds[g] += CHSV(meteorHue[m] + 30, 255, currentBrightness * 2.55);
+      }
+      if (random8() < 12 + currentSpeed / 4 && meteorPos[m] > NUM_LEDS - 5) {
+        meteorPos[m] = -1;
+      }
+    }
+  }
+  if (random8() < 8) {
+    int p = random16(NUM_LEDS);
+    leds[p] += CHSV(random8(), 200, currentBrightness * 2.55);
+  }
+}
+
+/*--- 8) Gradient Wave -------------------------------------------------------------------------*/
+void animGradient() {
+  static uint32_t last = 0;
+  static uint16_t t = 0;
+  uint32_t now = millis();
+  if (now - last > max(6, 48 - currentSpeed)) {
+    last = now;
+    t += 2 + (currentSpeed / 6);
+    for (int i = 0; i < NUM_LEDS; i++) {
+      uint16_t p = (i * 512 / max(1, NUM_LEDS));
+      uint8_t hue = (uint8_t)((p + (t >> 1) + sin8(i * 2 + (t >> 3))) & 0xFF);
+      uint8_t val = scale8(beatsin8(6 + (currentSpeed / 10), 80, 255), currentBrightness * 2.55);
+      leds[i] = CHSV(hue, 220, val);
+    }
+  }
+}
+
+/*--- 9) Fire (çöp ateşi) -----------------------------------------------------------------------*/
+void animFire() {
+  static uint32_t last = 0;
+  static uint8_t heat[NUM_LEDS];
+  static uint16_t fireTime = 0;
+  uint32_t now = millis();
+  if (now - last < max(15, 40 - currentSpeed)) return;
+  last = now;
+  fireTime += 3 + (currentSpeed / 8);
+
+  for (int i = 0; i < NUM_LEDS / 8; i++) {
+    int pos = random8(NUM_LEDS / 10);
+    uint8_t base = random8(100, 200) + random8(0,55);
+    heat[pos] = qadd8(heat[pos], base);
+  }
+  for (int i = NUM_LEDS - 1; i >= 2; i--) {
+    heat[i] = (heat[i-1] + heat[i-2] + heat[i-2]) / 3;
+  }
+  for (int i = 0; i < NUM_LEDS; i++) {
+    heat[i] = qsub8(heat[i], random8(5,15));
+  }
+  if (random8() < 30 + (currentSpeed / 3)) {
+    int spark = random16(NUM_LEDS / 4, NUM_LEDS / 2);
+    heat[spark] = qadd8(heat[spark], random8(100,180));
+  }
+  for (int i = 0; i < NUM_LEDS; i++) {
+    uint8_t t = heat[i];
+    CRGB col;
+    if (t < 60) col = CRGB(10,0,0);
+    else if (t < 120) col = CRGB(scale8(t-60,100),0,0);
+    else if (t < 180) col = CRGB(255, scale8(t-120,150),0);
+    else col = CRGB(255,255, scale8(t-180,100));
+    col.nscale8_video(currentBrightness * 2.55);
+    leds[i] = col;
+  }
+  uint8_t wave = beatsin8(6 + (currentSpeed/15), 50, 150);
+  for (int i = 0; i < NUM_LEDS; i++) {
+    uint8_t w = sin8((i*3)+(fireTime>>2));
+    leds[i].nscale8_video(scale8(w, wave));
+  }
+  FastLED.setBrightness(currentBrightness * 2.55);
+}
+
+/*--- 10) Pulse Zones (bölge‑tabanlı) -------------------------------------------------------------*/
+void animZones() {
+  static uint32_t last = 0;
+  static uint16_t phase = 0;
+  uint32_t now = millis();
+  if (now - last > max(6, 50 - currentSpeed)) {
+    last = now;
+    phase += 3 + (currentSpeed / 6);
+    int zones = constrain(NUM_LEDS / max(8, NUM_LEDS/5), 3, 8);
+    int zoneSize = max(1, NUM_LEDS / zones);
+    for (int i = 0; i < NUM_LEDS; i++) {
+      int z = i / zoneSize;
+      uint8_t baseHue = (z * (256 / max(1, zones))) + (phase / 4);
+      uint8_t wave = sin8((i*6)+(phase>>(1+(z%3))));
+      uint8_t bri = qmul8(wave, (uint8_t)(currentBrightness * 2.55));
+      CRGB c = CHSV(baseHue + (i%16), 240, bri);
+      if (random8() < (10 + currentSpeed/8))
+        c += CHSV(baseHue + random8(40,100),255,currentBrightness * 2.55);
+      leds[i] = c;
+    }
+  }
+}
+
+/*--- 11) Aurora (noise‑tabanlı) ---------------------------------------------------------------*/
+void animAurora() {
+  static uint32_t last = 0;
+  static uint16_t t = 0;
+  uint32_t now = millis();
+  if (now - last < max(4, 40 - currentSpeed/2)) return;
+  last = now;
+  t += 1 + (currentSpeed / 25);
+  CHSV baseHSV = rgb2hsv_approximate(currentColor);
+  for (int i = 0; i < NUM_LEDS; i++) {
+    uint8_t l1 = sin8((i*2)+(t>>2));
+    uint8_t l2 = sin8((i*3)+(t>>1));
+    uint8_t l3 = sin8((i*4)+t);
+    uint8_t hue = baseHSV.h + (l1>>3);
+    uint8_t sat = 200;
+    uint8_t val = qadd8(l2,l3);
+    val = scale8(val, currentBrightness * 2.55 / 2);
+    leds[i] = CHSV(hue, sat, val);
+  }
+  FastLED.setBrightness(max(1, (int)(currentBrightness * 2.55)));
+}
+
+/*--- 12) Matrix‑Rain (noise + drops) -----------------------------------------------------------*/
+void animMatrix() {
+  struct Drop { float pos; float speed; uint8_t len; uint8_t hue; };
+  const uint8_t MAX_DROPS = min(48, max(8, NUM_LEDS/8));
+  static Drop drops[48];
+  static bool init = false;
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  if (!init) {
+    init = true;
+    for (uint8_t i=0;i<MAX_DROPS;i++) {
+      drops[i].pos  = -random16(NUM_LEDS);
+      drops[i].speed = (float)random8(6,16)/8.0f;
+      drops[i].len   = random8(3,18);
+      drops[i].hue   = 96 + random8(0,40);
+    }
+  }
+  uint16_t frameDelay = max(8, 60 - currentSpeed);
+  if (now - last < frameDelay) return;
+  last = now;
+  fadeToBlackBy(leds, NUM_LEDS, 30);
+  for (uint8_t d=0; d<MAX_DROPS; d++) {
+    drops[d].pos += drops[d].speed * (1.0f + currentSpeed/100.0f);
+    if (drops[d].pos - drops[d].len > NUM_LEDS) {
+      drops[d].pos = -random8(0, NUM_LEDS/3);
+      drops[d].speed = (float)random8(6,20)/8.0f;
+      drops[d].len   = random8(3,18);
+      drops[d].hue   = 80 + random8(0,70);
+    }
+    int head = (int)floor(drops[d].pos);
+    for (uint8_t s=0; s<drops[d].len; s++) {
+      int idx = head - s;
+      if (idx < 0 || idx >= NUM_LEDS) continue;
+      uint8_t bright = 255 - (uint8_t)(s * 200 / drops[d].len);
+      bright = scale8(bright, currentBrightness * 2.55);
+      leds[idx] += CHSV(drops[d].hue, 200, bright);
+    }
+  }
+  FastLED.setBrightness(max(1, (int)(currentBrightness * 2.55)));
+}
+
+/*--- 13) Twinkle (parıltı) --------------------------------------------------------------------*/
+void animTwinkle() {
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  if (now - last < max(8, 40 - currentSpeed)) return;
+  last = now;
+  uint8_t density = constrain(6 + (currentSpeed / 5), 6, 140);
+  uint8_t baseBri = max(8, (int)(currentBrightness * 2.55));
+  for (int i=0; i<NUM_LEDS; i++) {
+    uint16_t seed = (uint16_t)(i*257) ^ (now>>4);
+    uint8_t chance = (uint8_t)(((seed>>8) ^ (seed&0xFF)) & 0xFF);
+    if (random8() < density && (chance & 0x7F) < density) {
+      uint8_t life = random8(120,360);
+      uint8_t phase = (uint8_t)((now>>2) + (seed & 0xFF));
+      uint8_t env = sin8(phase);
+      uint8_t b = qmul8(env, baseBri);
+      CHSV hsv = rgb2hsv_approximate(currentColor);
+      uint8_t hueOff = hsv.h + (seed & 31) - 16;
+      leds[i] = leds[i] + CHSV(hueOff, min(255, hsv.s+20), b);
+    } else {
+      leds[i].nscale8_video(245);
+    }
+  }
+  FastLED.setBrightness(max(1,(int)(currentBrightness*2.55)));
+}
+
+/*--- 14) Ripple (su dalgası) ----------------------------------------------------------------*/
+void animRipple() {
+  struct Ripple { int center; float radius; float speed; uint8_t hue; uint8_t life; bool active; };
+  const uint8_t MAX_R = 6;
+  static Ripple rip[MAX_R];
+  static bool init = false;
+  static uint32_t last = 0;
+  uint32_t now = millis();
+
+  if (!init) {
+    init = true;
+    for (uint8_t i=0;i<MAX_R;i++) rip[i].active = false;
+  }
+
+  if (now - last < max(6, 45 - currentSpeed)) return;
+  last = now;
+
+  for (int i=0;i<NUM_LEDS;i++) leds[i].nscale8_video(240);
+
+  if (random8() < (40 + currentSpeed)) { // yeni ripple yarat
+    for (uint8_t i=0;i<MAX_R;i++) if (!rip[i].active) {
+      rip[i].active = true;
+      rip[i].center = random16(NUM_LEDS);
+      rip[i].radius = 0.0f;
+      rip[i].speed = (0.6f + random8(60)/100.0f) * (1.0f + currentSpeed/100.0f);
+      rip[i].hue = (uint8_t)(rgb2hsv_approximate(currentColor).h + random8(0,40) - 20);
+      rip[i].life = 255;
+      break;
+    }
+  }
+
+  for (uint8_t i=0;i<MAX_R;i++) {
+    if (!rip[i].active) continue;
+    rip[i].radius += rip[i].speed;
+    rip[i].life = qsub8(rip[i].life, 2 + (currentSpeed/40));
+    int cen = rip[i].center;
+    float rad = rip[i].radius;
+    int width = max(3, (int)(5 + currentSpeed/20));
+    int start = (int)floor(rad) - width - 1;
+    int end   = (int)ceil (rad) + width + 1;
+    for (int d = start; d <= end; d++) {
+      int pos = cen + d;
+      while (pos < 0)    pos += NUM_LEDS;
+      while (pos >= NUM_LEDS) pos -= NUM_LEDS;
+      int dist = abs(d);
+      uint8_t fall = 255;
+      int denom = max(1, width + abs((int)rad)/6);
+      fall = qsub8(255, (uint8_t)((uint16_t)dist * 200UL / denom));
+      uint8_t mod = sin8((uint8_t)(dist * 12 + (uint8_t)rad*3));
+      uint8_t b = qmul8(qmul8(fall, mod), (uint8_t)(currentBrightness*2.55));
+      leds[pos] += CHSV(rip[i].hue, 220, b);
+    }
+    if (rip[i].life < 8 || rad > (NUM_LEDS+50)) rip[i].active = false;
+  }
+  FastLED.setBrightness(max(1,(int)(currentBrightness*2.55)));
+}
+
+/*--- Animasyonu Seçen Merkezi Fonksiyon --------------------------------------------------------*/
+void renderAnimation() {
+  switch (currentAnimation) {
+    case ANIM_SOLID:      animSolid();    break;
+    case ANIM_PULSE:      animPulse();    break;
+    case ANIM_THEATER:    animTheater();  break;
+    case ANIM_RAINBOW:    animRainbow();  break;
+    case ANIM_SCANNER:    animScanner();  break;
+    case ANIM_COMET:      animComet();    break;
+    case ANIM_METEOR:     animMeteor();   break;
+    case ANIM_GRADIENT:   animGradient(); break;
+    case ANIM_FIRE:       animFire();     break;
+    case ANIM_ZONES:      animZones();    break;
+    case ANIM_AURORA:     animAurora();   break;
+    case ANIM_MATRIX:     animMatrix();   break;
+    case ANIM_TWINKLE:    animTwinkle();  break;
+    case ANIM_RIPPLES:    animRipple();   break;
+    default:              animSolid();    break;
+  }
+  FastLED.show();
+}
+
+/*========================================================================================================================*/
+/*  9. FREE‑RTOS Görevleri (Core‑1: LED‑Render, Core‑0: Sensor/Wi‑Fi)                                                */
+/*========================================================================================================================*/
+
+void taskRender(void *pv) {
+  (void)pv;
+  for (;;) {
+    if (ledsActive) renderAnimation();
+    else {
+      fill_solid(leds, NUM_LEDS, CRGB::Black);
+      FastLED.show();
+      vTaskDelay(pdMS_TO_TICKS(20));    // LED kapalıyken CPU boşta
+    }
+    vTaskDelay(1);                      // 1 tick (≈ 1 ms) yield
+  }
+}
+
+void taskSensor(void *pv) {
+  (void)pv;
+  for (;;) {
+    processSensor();          // hareket algılama + kalibrasyon
+    TimeMgr.loop();           // NTP, parlaklık, planlı restart
+    ArduinoOTA.handle();       // OTA (non‑blocking)
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+/*========================================================================================================================*/
+/* 10. WIFI RECONNECT (periyodik)                                                                                     */
+/*========================================================================================================================*/
+
+void reconnectWiFi() {
+  static unsigned long lastAttempt = 0;
+  if (WiFi.isConnected()) return;
+  unsigned long now = millis();
+  if (now - lastAttempt < WIFI_RECONNECT_INTERVAL) return;
+  lastAttempt = now;
+
+  Serial.println("[WiFi] Bağlantı kaybedildi – yeniden bağlanıyor …");
+  WiFi.disconnect(true);
+  WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (!WiFi.isConnected() && millis() - start < 10000) {
+    delay(300);
+    Serial.print(".");
+  }
+  if (WiFi.isConnected()) {
+    Serial.println("\n[WiFi] Yeniden bağlandı, IP: " + WiFi.localIP().toString());
+    if (webServerStarted) { server.end(); startWebServer(); }
+  } else {
+    Serial.println("\n[WiFi] Yeniden bağlanma başarısız");
+  }
+}
+
+/*========================================================================================================================*/
+/* 11. SAFE RESTART (OTA‑korumalı)                                                                                     */
+/*========================================================================================================================*/
+
+void safeRestart(const char *reason) {
+  Serial.printf("\n--- SAFE RESTART: %s ---\n", reason);
+  if (otaInProgress) {
+    Serial.println("[Restart] OTA sürüyor – yeniden başlatma atlandı");
+    return;
+  }
+  // LED’leri söndür
+  fill_solid(leds, NUM_LEDS, CRGB::Black);
+  FastLED.show();
+  delay(100);
+  // Wi‑Fi kapat
+  if (WiFi.isConnected()) WiFi.disconnect(true, true);
+  // Zaman/Parlaklık manager durumu kaydet
+  TimeMgr.saveState();
+  // Preferences kapanışı
+  preferences.end();
+  // Web server kapat
+  if (webServerStarted) server.end();
+  // ESP‑32‑S3 yeniden başlat
+  esp_restart();
+}
+
+/*========================================================================================================================*/
+/* 12. SETUP / LOOP (boş)                                                                                              */
+/*========================================================================================================================*/
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== Xiao ESP32‑S3 LED Controller ===");
+
+  /*--- Preferences (kalıcı ayarlar) ------------------------------------------------------*/
+  preferences.begin(PREF_NS, false);
+  currentAnimation   = preferences.getUChar(KEY_ANIM, DEFAULT_ANIMATION);
+  currentBrightness  = preferences.getUChar(KEY_BRIGHT, DEFAULT_BRIGHTNESS);
+  currentSpeed       = preferences.getUChar(KEY_SPEED, DEFAULT_SPEED);
+  currentColor       = preferences.getULong(KEY_COLOR, 0xFFFFFF);
+  holdTimeMs         = preferences.getUShort(KEY_HOLD, DEFAULT_HOLD_TIME) * 1000UL;
+  sensitivity        = preferences.getUChar(KEY_SENS, DEFAULT_SENSITIVITY);
+  movementThreshold  = preferences.getUShort(KEY_THR, MOVEMENT_THRESHOLD);
+  Serial.printf("[Prefs] Anim=%u Bright=%u Speed=%u Hold=%lus Sens=%u Thr=%u\n",
+                currentAnimation, currentBrightness, currentSpeed,
+                holdTimeMs/1000, sensitivity, movementThreshold);
+
+  /*--- FastLED --------------------------------------------------------------------------*/
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+  FastLED.setBrightness(gamma8(currentBrightness * 255 / 100));
+  FastLED.clear(true);
+
+  /*--- Sensör pinleri -------------------------------------------------------------------*/
+  pinMode(SENSOR_DIGITAL_PIN, INPUT);
+  pinMode(SENSOR_ANALOG_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(SENSOR_DIGITAL_PIN), motionISR, RISING);
+  memset(analogSamples, 0, sizeof(analogSamples));
+
+  /*--- Wi‑Fi, NTP, OTA ---------------------------------------------------------------*/
+  initWifi();
+  TimeMgr.begin();          // NTP & parlaklık yöneticisi
+  initOTA();
+  startWebServer();
+
+  /*--- FreeRTOS Görevleri --------------------------------------------------------------*/
+  xTaskCreatePinnedToCore(taskRender, "LED_Render", 8192, nullptr, 2, nullptr, 1); // Core‑1
+  xTaskCreatePinnedToCore(taskSensor, "Sensor_Task", 4096, nullptr, 2, nullptr, 0); // Core‑0
+
+  Serial.println("[Setup] Tamamlandı – görevler çalışıyor");
+}
+
+/*--- loop() boş – tüm işler FreeRTOS görevlerinde yürür -----------------------------------*/
+void loop() {
+  reconnectWiFi();   // periyodik Wi‑Fi yeniden bağlanma
+  delay(1);        // küçük yield, watchdog yok
+}
